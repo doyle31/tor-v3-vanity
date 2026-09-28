@@ -56,9 +56,10 @@ pub struct BytePrefixOwned {
     pub byte_prefix: rustacuda::memory::DeviceBuffer<u8>,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
-    /// 64-byte expanded secret key (clamped scalar || nonce prefix).
+    /// Capture ring: `SLOTS` expanded keys of `SLOT_BYTES` bytes each.
     pub out: rustacuda::memory::DeviceBuffer<u8>,
-    pub success: rustacuda::memory::DeviceBox<bool>,
+    /// How many keys the kernel published into the ring this launch.
+    pub count: rustacuda::memory::DeviceBox<u32>,
 }
 impl BytePrefixOwned {
     pub fn from_str(s: &str) -> Self {
@@ -74,17 +75,17 @@ impl BytePrefixOwned {
             last_byte_idx += 1;
         }
         let gpu_byte_prefix = rustacuda::memory::DeviceBuffer::from_slice(&byte_prefix).unwrap();
-        // The kernel now returns a full expanded key, not just a 32-byte seed.
-        let out = [0u8; 64];
+        // The kernel publishes into a ring of `SLOTS` expanded keys per prefix,
+        // not a single slot: one slot capped a whole launch at one key.
+        let out = vec![0u8; core::SLOTS * core::SLOT_BYTES];
         let gpu_out = rustacuda::memory::DeviceBuffer::from_slice(&out).unwrap();
-        let success = false;
-        let gpu_success = rustacuda::memory::DeviceBox::new(&success).unwrap();
+        let gpu_count = rustacuda::memory::DeviceBox::new(&0u32).unwrap();
         BytePrefixOwned {
             byte_prefix: gpu_byte_prefix,
             last_byte_idx,
             last_byte_mask,
             out: gpu_out,
-            success: gpu_success,
+            count: gpu_count,
         }
     }
     pub fn as_byte_prefix(&mut self) -> core::BytePrefix {
@@ -94,7 +95,7 @@ impl BytePrefixOwned {
             last_byte_idx: self.last_byte_idx,
             last_byte_mask: self.last_byte_mask,
             out: self.out.as_device_ptr(),
-            success: self.success.as_device_ptr(),
+            count: self.count.as_device_ptr(),
         }
     }
 }
@@ -128,23 +129,33 @@ fn upload_power_table() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
     Ok(rustacuda::memory::DeviceBuffer::from_slice(words).unwrap())
 }
 
+/// Start one search thread per CUDA device.
+///
+/// Returns a handle to the count of keys that matched but could not be
+/// captured, so the caller can report a saturated ring instead of silently
+/// losing keys.
 pub fn cuda_try_loop(
     prefixes: &[String],
     sender: crossbeam_channel::Sender<[u8; 64]>,
     tries_sender: crossbeam_channel::Sender<u64>,
-) -> Result<(), Error> {
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>, Error> {
     use rustacuda::launch;
     use rustacuda::memory::DeviceBox;
     use rustacuda::prelude::*;
     use std::ffi::CString;
 
     rustacuda::init(CudaFlags::empty())?;
+    // Keys found but not captured, because a launch published more matches
+    // than one prefix's ring can hold. Surfaced so a saturated ring is visible
+    // rather than silently discarding keys.
+    let dropped_keys = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut i = 0;
     for device in rustacuda::device::Device::devices()? {
         let device = device?;
         let prefixes = prefixes.to_owned();
         let sender = sender.clone();
         let tries_sender = tries_sender.clone();
+        let dropped_keys = dropped_keys.clone();
         std::thread::spawn(move || {
             use rand::RngCore;
             let mut csprng = assert_crypto_rng(rand::thread_rng());
@@ -220,6 +231,10 @@ pub fn cuda_try_loop(
                 i, threads, blocks, keys_per_launch
             );
 
+            // Staging buffer for the capture ring, allocated once and reused:
+            // `copy_to` insists on a full-length destination.
+            let mut ring = vec![0u8; core::SLOTS * core::SLOT_BYTES];
+
             loop {
                 csprng.fill_bytes(&mut seed);
                 gpu_seed.copy_from(&seed).unwrap();
@@ -235,12 +250,35 @@ pub fn cuda_try_loop(
                 gpu_byte_prefixes.copy_to(&mut byte_prefixes).unwrap();
 
                 for prefix in &mut byte_prefixes_owned {
-                    let mut success = false;
-                    prefix.success.copy_to(&mut success).unwrap();
-                    if success {
-                        prefix.success.copy_from(&false).unwrap();
+                    // Drain every key the kernel captured this launch, not just
+                    // one. `count` is the true number of matches; the ring can
+                    // only hold SLOTS of them, and any excess was dropped
+                    // rather than overwritten.
+                    let mut count: u32 = 0;
+                    prefix.count.copy_to(&mut count).unwrap();
+                    if count == 0 {
+                        continue;
+                    }
+                    prefix.count.copy_from(&0u32).unwrap();
+
+                    let found = count as usize;
+                    let captured = core::SLOTS.min(found);
+                    if found > core::SLOTS {
+                        dropped_keys.fetch_add(
+                            (found - core::SLOTS) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    // `copy_to` requires equal lengths and rustacuda has no
+                    // sub-range copy, so the whole ring comes back and only the
+                    // captured prefix is used. At SLOTS=2048 that is 128 KiB per
+                    // launch against a ~34 ms launch: ~0.04% of the budget.
+                    prefix.out.copy_to(&mut ring).unwrap();
+                    for k in 0..captured {
                         let mut out = [0u8; 64];
-                        prefix.out.copy_to(&mut out).unwrap();
+                        out.copy_from_slice(
+                            &ring[k * core::SLOT_BYTES..(k + 1) * core::SLOT_BYTES],
+                        );
                         sender.send(out).unwrap();
                     }
                 }
@@ -254,7 +292,7 @@ pub fn cuda_try_loop(
         eprintln!("No cuda devices available.");
         std::process::exit(2);
     }
-    Ok(())
+    Ok(dropped_keys)
 }
 
 fn main() {
@@ -333,8 +371,9 @@ fn main() {
 
     let (send, recv) = crossbeam_channel::unbounded();
     let (send_tries, recv_tries) = crossbeam_channel::bounded(1);
-    cuda_try_loop(&prefixes, send, send_tries).unwrap();
+    let dropped_keys = cuda_try_loop(&prefixes, send, send_tries).unwrap();
 
+    let dropped_keys = dropped_keys.clone();
     std::thread::spawn(move || {
         let now = Instant::now();
         let mut last_log = Instant::now();
@@ -356,6 +395,15 @@ fn main() {
                     "Running for {} / {} (expected).",
                     dur_pretty, expected_dur_pretty
                 );
+                let dropped = dropped_keys.load(std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    println!(
+                        "WARNING: {} keys matched but were dropped -- a launch \
+                         published more than the {} slots per prefix.",
+                        dropped,
+                        core::SLOTS
+                    );
+                }
                 last_log = Instant::now();
             }
         }

@@ -46,6 +46,27 @@ pub struct KernelParams {
     pub byte_prefixes_len: usize,
 }
 
+/// Expanded keys captured per prefix per launch.
+///
+/// Each prefix used to have a single 64-byte output slot plus a `success`
+/// flag, so a launch could return at most **one** key per prefix no matter how
+/// many it found. The host then read that slot once per launch and reset it.
+/// With 1,310,720 keys per launch, a 2-character prefix matches ~1,280 times
+/// per launch and a 3-character prefix ~40, but only one survived.
+///
+/// Measured effect: the GPU ran at 39M keys/s while keys actually arrived at
+/// 24/s -- one per 1.6 million tried, where the expected rate is one per 1,024.
+///
+/// A ring fixes it, and the readback is proportional to the keys *actually
+/// captured*, not to the ring size, so a generous ring costs one allocation and
+/// no extra transfer. 2048 slots covers the matches per launch of a 2-character
+/// prefix (~1,280) with headroom, after which the only limit is the GPU itself.
+/// Prefixes of 3 characters or more (~40 matches per launch) never fill it.
+pub const SLOTS: usize = 2048;
+
+/// Bytes of expanded key per slot.
+pub const SLOT_BYTES: usize = 64;
+
 #[derive(DeviceCopy, Clone)]
 #[repr(C)]
 pub struct BytePrefix {
@@ -53,8 +74,10 @@ pub struct BytePrefix {
     pub byte_prefix_len: usize,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
+    /// `SLOTS * SLOT_BYTES` bytes: a ring of captured expanded keys.
     pub out: DevicePointer<u8>,
-    pub success: DevicePointer<bool>,
+    /// Atomic count of matches published this launch, also the ring cursor.
+    pub count: DevicePointer<u32>,
 }
 
 impl BytePrefix {

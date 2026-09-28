@@ -154,7 +154,7 @@ pub enum Sink {
 /// So each write also flushes once `FLUSH_AFTER` has elapsed, bounding the loss
 /// to one interval of keys rather than to a whole buffer. Matches are rare
 /// enough (about one per 2^(5*prefix_len)) that this costs nothing measurable.
-struct Flusher {
+pub struct Flusher {
     last: std::time::Instant,
 }
 

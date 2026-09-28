@@ -44,10 +44,12 @@
 
 // Imports used by `BatchState` and the batch maths, which compile for both
 // the device and the host (the latter so the unit tests can exercise them).
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::field::Fe;
 use super::group::{ge_add, ge_base, ge_double, ge_to_bytes_with_zi, scalarmult_base_table, Ge};
 use super::sha512::sha512;
-use super::{BytePrefix, KernelParams};
+use super::{BytePrefix, KernelParams, SLOT_BYTES, SLOTS};
 
 // Used only by the `render` entry point, which is device-only.
 #[cfg(target_arch = "nvptx64")]
@@ -161,11 +163,16 @@ impl BatchState {
         }
     }
 
-    /// Publish buffered matches through the prefix slots.
+    /// Publish buffered matches into each prefix's capture ring.
     ///
-    /// Writes through a raw pointer: the device crate offers no aliasing
-    /// guarantees, and the host allocates one `out`/`success` pair per prefix
-    /// so threads with different matches never collide.
+    /// Writes through raw pointers: the device crate offers no aliasing
+    /// guarantees. The slot index is claimed with a device-scope atomic, so
+    /// threads that match the same prefix in the same launch each take a
+    /// distinct slot instead of overwriting one another.
+    ///
+    /// Once the ring is full the excess is dropped rather than wrapping, so a
+    /// key is never overwritten by a later one. The host reads `count` to see
+    /// how many were found, and can tell that it captured fewer than that.
     pub fn flush(&mut self, params: &KernelParams) {
         let base = params.byte_prefixes.as_raw() as *mut BytePrefix;
         for h in 0..self.n_hits {
@@ -173,18 +180,33 @@ impl BatchState {
             for i in 0..params.byte_prefixes_len {
                 let bp = unsafe { &mut *base.add(i) };
                 if bp.matches(&hit.pubkey) {
-                    let out = bp.out.as_raw_mut();
                     unsafe {
-                        for k in 0..64 {
-                            *out.add(k) = hit.expanded[k];
+                        // Claim a slot. `count` only ever increases within a
+                        // launch, so every claim gets a distinct index.
+                        let idx = atomic_add(bp.count.as_raw_mut(), 1) as usize;
+                        if idx < SLOTS {
+                            let out = bp.out.as_raw_mut().add(idx * SLOT_BYTES);
+                            for k in 0..SLOT_BYTES {
+                                *out.add(k) = hit.expanded[k];
+                            }
                         }
-                        *bp.success.as_raw_mut() = true;
                     }
                 }
             }
         }
         self.n_hits = 0;
     }
+}
+
+/// `atom.relaxed.sys.add.u32`, returning the pre-increment value.
+///
+/// `Relaxed` is sufficient: the returned index only has to be unique, each
+/// thread writes solely to the slot it claimed, and the host reads the ring
+/// after the launch completes. LLVM lowers this to a real PTX atomic (verified:
+/// `atom.relaxed.sys.add.u32`), so no inline asm is needed.
+#[inline(always)]
+fn atomic_add(ptr: *mut u32, val: u32) -> u32 {
+    unsafe { (*(ptr as *const AtomicU32)).fetch_add(val, Ordering::Relaxed) }
 }
 
 /// `8B`, the walk step: three doublings of the base point.

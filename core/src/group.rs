@@ -337,7 +337,16 @@ pub fn build_power_table(table: &mut [Ge; TABLE_LEN]) {
 // ---------------------------------------------------------------------------
 
 /// Bits per comb window. Build-time tunable so it can be swept without code
-/// changes; see `01-comb.md` for the table-size / operation-count tradeoff.
+/// changes; `COMBPARAMS.md` has the table-size / operation-count arithmetic
+/// behind the default of 4.
+///
+/// **Changing this is a one-line change and nothing else**: every window size
+/// the comb supports goes through the same `_w` code below, and the host test
+/// suite exercises *all* of them (`comb_slot_exhaustive_for_w`,
+/// `comb_matches_ladder_for_w`) whatever this is set to. That matters because
+/// the tests used to run only the size the crate happened to be built with, so
+/// a sweep of `T3V_COMB_W` could only ever be validated one point at a time --
+/// and, worse, a *bad* point was only discovered at run time.
 pub const COMB_W: usize = match option_env!("T3V_COMB_W") {
     Some(s) => crate::parse_usize(s.as_bytes()),
     None => 4,
@@ -351,16 +360,142 @@ pub const COMB_FIRST_BIT: usize = 3;
 /// Scalar bits 3..=254 inclusive.
 pub const COMB_BITS: usize = 252;
 
-/// Windows of `COMB_W` bits covering `COMB_BITS`. `COMB_W` must divide
-/// `COMB_BITS` so that no window runs off the top of the scalar.
-pub const COMB_WINDOWS: usize = COMB_BITS / COMB_W;
+/// u64 words in one `Niels` (three field elements, no padding).
+pub const NIELS_WORDS: usize = 15;
+
+/// Bytes in one `Niels`.
+pub const NIELS_BYTES: usize = NIELS_WORDS * 8;
+
+/// Smallest window worth building. `W == 1` is the `[2^i]B` ladder this comb
+/// replaced, one table entry per bit and 252 additions, so it is excluded by
+/// name rather than by the arithmetic below.
+pub const COMB_W_MIN: usize = 2;
+
+/// Largest window the digit extractor can read.
+///
+/// The extractor takes `W` bits starting at a bit offset of at most 7, out of a
+/// two-byte read covering bits 0..=15 of `(lo | hi << 8)`. The last bit it needs
+/// is therefore at position `off + W - 1 <= 15`, i.e. `W <= 16 - off`, and the
+/// worst case is `off == 7`: **`W <= 9`**. At 10 the extractor would silently
+/// drop the top digit bit and hand back a slot in the wrong half of the window.
+///
+/// That is the largest value the *arithmetic* allows, and it is far above
+/// anything usable: `W == 9` is 28 windows of 512 slots, a 1.6 MiB table, so the
+/// L1 rule below rejects it long before the extractor's own limit is reached.
+/// The bound is stated anyway because it is what makes the extractor's in-bounds
+/// argument finite, and because `comb_slot_read_is_safe` checks it per window
+/// rather than trusting it.
+pub const COMB_W_MAX: usize = 9;
+
+/// L1 data cache per SM, bytes. sm_86 has a 128 KiB unified L1/shared block.
+///
+/// **This is the binding constraint on the window size, and it is not a soft
+/// one.** The table is read by all eight warps of a block, and the block is the
+/// only one resident per SM at 255 registers/thread, so the eight warps march
+/// through the windows roughly in lockstep: the table is pulled in *once* per SM
+/// per launch and the other seven passes hit. That is a 1x cost. A table that
+/// does not fit turns each of the eight passes into a fresh miss, so the cost
+/// jumps 8x: at `W == 7` that is 4.1 MB of L2 traffic per SM per launch, about
+/// 78 GB/s across the device, which does not fit in DRAM alongside everything
+/// else the kernel streams. `COMBPARAMS.md` works through the numbers.
+pub const COMB_L1_BYTES: usize = 128 * 1024;
+
+/// Table slots per window for a window of `w` bits: the identity (digit 0) plus
+/// every non-zero `w`-bit pattern.
+pub const fn comb_slots(w: usize) -> usize {
+    1 << w
+}
+
+/// Windows of `w` bits needed to cover `COMB_BITS`.
+///
+/// **Integer division, so this is a floor.** A `w` that does not divide
+/// `COMB_BITS` leaves the top `COMB_BITS - comb_bits_covered(w)` bits
+/// uncovered, and because clamping always sets bit 254 that is not a rounding
+/// detail -- it is a wrong answer. `comb_w_ok` rejects such a `w` at compile
+/// time, and `w5_would_drop_the_top_bits` demonstrates what it would cost.
+pub const fn comb_windows(w: usize) -> usize {
+    COMB_BITS / w
+}
+
+/// Scalar bits the windows of width `w` actually cover. Equal to `COMB_BITS`
+/// exactly when `w` divides it; `comb_windows(w) * w < COMB_BITS` is the
+/// dropped-bit count otherwise.
+pub const fn comb_bits_covered(w: usize) -> usize {
+    comb_windows(w) * w
+}
+
+/// Total comb table entries for a window of `w` bits.
+pub const fn comb_len(w: usize) -> usize {
+    comb_windows(w) * comb_slots(w)
+}
+
+/// Bytes of device memory the whole uploaded blob occupies for a window of
+/// `w` bits: the comb table plus `8B` (`comb_len(w) + 1` Niels).
+pub const fn comb_table_bytes(w: usize) -> usize {
+    (comb_len(w) + 1) * NIELS_BYTES
+}
+
+/// Is `w` a window size this implementation can actually run?
+///
+/// The three conditions, in the order they matter:
+///
+/// 1. `w` divides `COMB_BITS`, or the top windows are silently dropped
+///    (`w5_would_drop_the_top_bits` shows the resulting wrong point).
+/// 2. `w <= COMB_L1_BYTES` worth of table, or every launch re-streams it eight
+///    times over (see `COMB_L1_BYTES`).
+/// 3. `COMB_W_MIN <= w <= COMB_W_MAX`, so the digit extractor reads in bounds.
+///
+/// This is a `const fn` so it can gate a `const _: () = assert!(...)` -- see
+/// below -- and it is the single definition the runtime asserts and the tests
+/// use, so the build-time rule and the tested rule cannot drift apart.
+pub const fn comb_w_ok(w: usize) -> bool {
+    w >= COMB_W_MIN
+        && w <= COMB_W_MAX
+        && COMB_BITS % w == 0
+        && comb_table_bytes(w) <= COMB_L1_BYTES
+}
+
+// The three `T3V_COMB_W` preconditions, as *compile* errors.
+//
+// Before this, a bad window size was caught by `assert!`s in two run-time
+// places, and the failure modes were both bad. The host assert fired inside the
+// per-device search thread, so the binary started, searched nothing, and the
+// only clue was a panic message on a detached thread. The in-kernel assert was
+// better (LLVM folds a compile-time-false assert, so `render` compiled to four
+// instructions that call `panic` and trap -- verified with
+// `T3V_COMB_W=5 cargo build --release`, which produced a 73-line PTX and a
+// 16-instruction cubin) but it still only surfaced when someone ran the
+// binary. A build-time tunable should be validated by the build.
+//
+// Three asserts rather than one so each failure names the rule it broke.
+const _: () = assert!(
+    COMB_W >= COMB_W_MIN && COMB_W <= COMB_W_MAX,
+    "T3V_COMB_W: the comb window must be in COMB_W_MIN..=COMB_W_MAX (2..=9); \
+     see COMBPARAMS.md"
+);
+const _: () = assert!(
+    COMB_BITS % COMB_W == 0,
+    "T3V_COMB_W: the comb window must divide COMB_BITS (252), or the top \
+     windows are silently dropped -- 252 % 5 == 2 drops bits 253 and 254, and \
+     clamping always sets bit 254"
+);
+const _: () = assert!(
+    comb_table_bytes(COMB_W) <= COMB_L1_BYTES,
+    "T3V_COMB_W: the comb table must fit in the 128 KiB L1, or all eight warps \
+     re-stream it every launch; W=5 already needs 181 KiB"
+);
+
+/// Windows of `COMB_W` bits covering `COMB_BITS`. `COMB_W` divides
+/// `COMB_BITS` -- enforced above at compile time -- so no window runs off the
+/// top of the scalar and `comb_bits_covered(COMB_W) == COMB_BITS`.
+pub const COMB_WINDOWS: usize = comb_windows(COMB_W);
 
 /// Table slots per window: the identity (digit 0) plus every non-zero
 /// `COMB_W`-bit pattern.
-pub const COMB_SLOTS: usize = 1 << COMB_W;
+pub const COMB_SLOTS: usize = comb_slots(COMB_W);
 
 /// Total comb table entries.
-pub const COMB_LEN: usize = COMB_WINDOWS * COMB_SLOTS;
+pub const COMB_LEN: usize = comb_len(COMB_W);
 
 /// Everything the kernel needs that depends only on the base point: the comb
 /// table and the walk step `8B`, both in Niels form.
@@ -374,9 +509,6 @@ pub struct BaseTables {
     /// point; it lives here so the walk needs no `[2^i]B` array at all.
     pub eight: Niels,
 }
-
-/// u64 words in one `Niels` (three field elements, no padding).
-pub const NIELS_WORDS: usize = 15;
 
 /// u64 words in the whole uploaded blob.
 pub const BASE_TABLE_WORDS: usize = COMB_LEN * NIELS_WORDS + NIELS_WORDS;
@@ -393,15 +525,58 @@ pub const BASE_TABLE_WORDS: usize = COMB_LEN * NIELS_WORDS + NIELS_WORDS;
 /// normalised into Niels form with one *batched* inversion (Montgomery's trick)
 /// rather than one inversion per entry. Building the table costs a few
 /// thousand field multiplies, once, on the host.
+///
+/// **This is the only production entry point into the builder** and it refuses
+/// any window size that `comb_w_ok` rejects, so the host can never upload a
+/// table the device was not built to read.
 pub fn build_comb_table(comb: &mut [Niels; COMB_LEN], eight: &mut Niels) {
-    // 2..=4 is the useful range: COMB_W must also divide COMB_BITS (252), and
-    // the table is 2^COMB_W slots per window, so 5/6/7 are either impossible or
-    // absurdly large (315 KiB at 6, 540 KiB at 7). See `01-comb.md`.
+    build_comb_table_w::<COMB_W>(comb, eight)
+}
+
+/// [`build_comb_table`] for any window size, checking that the size is one this
+/// build can run.
+pub fn build_comb_table_w<const W: usize>(comb: &mut [Niels], eight: &mut Niels) {
     assert!(
-        COMB_W >= 2 && COMB_W <= 4,
-        "T3V_COMB_W must be in 2..=4"
+        comb_w_ok(W),
+        "a {W}-bit comb window is not usable: it must be in {COMB_W_MIN}..={COMB_W_MAX}, \
+         divide {COMB_BITS}, and fit its table in {COMB_L1_BYTES} bytes of L1 \
+         (a {W}-bit window needs {})",
+        comb_table_bytes(W)
     );
-    assert!(COMB_BITS % COMB_W == 0, "T3V_COMB_W must divide 252");
+    build_comb_table_at(W, comb, eight);
+}
+
+/// Largest slot count [`build_comb_table_at`] will allocate scratch for, and
+/// therefore the largest window that function accepts.
+///
+/// The scratch is three arrays of `2^w` points on the stack, so this is a
+/// stack bound rather than a comb bound: 128 slots is 15 KiB, which is fine for
+/// the host and irrelevant on the device, where the builder never runs. It is
+/// also the largest width `comb_w_ok` can *accept*, since `W == 8` needs 256
+/// slots and stops dividing 252 anyway.
+pub const COMB_AT_MAX_SLOTS: usize = 128;
+
+/// The table builder itself, for a window size given at run time.
+///
+/// **Performs no validation**: it will happily build the wrong table for a
+/// `w` that does not tile the scalar, which is exactly what
+/// `w5_would_drop_the_top_bits` uses it to demonstrate. Everything else in the
+/// crate goes through [`build_comb_table_w`], which gates on `comb_w_ok`.
+pub fn build_comb_table_at(w: usize, comb: &mut [Niels], eight: &mut Niels) {
+    let slots = comb_slots(w);
+    let windows = comb_windows(w);
+    assert!(
+        slots <= COMB_AT_MAX_SLOTS,
+        "a {w}-bit comb window needs {slots} slots of scratch; this builder \
+         allocates at most {}",
+        COMB_AT_MAX_SLOTS
+    );
+    assert!(
+        comb.len() >= windows * slots,
+        "the comb table needs {} entries for a {w}-bit window, got {}",
+        windows * slots,
+        comb.len()
+    );
 
     let zero = Ge {
         x: FE_ZERO,
@@ -413,17 +588,19 @@ pub fn build_comb_table(comb: &mut [Niels; COMB_LEN], eight: &mut Niels) {
     build_power_table(&mut power);
 
     // Per-window scratch: the window's points, their Z coordinates, and the
-    // prefix products `batch_invert_into` needs.
-    let mut points = [zero; COMB_SLOTS];
-    let mut zs = [FE_ONE; COMB_SLOTS];
-    let mut scratch = [FE_ONE; COMB_SLOTS];
+    // prefix products `batch_invert_into` needs. Sized for the widest window
+    // the builder accepts rather than for `w`, because `slots` is a run-time
+    // value here and a `[T; slots]` repeat needs a constant.
+    let mut points = [zero; COMB_AT_MAX_SLOTS];
+    let mut zs = [FE_ONE; COMB_AT_MAX_SLOTS];
+    let mut scratch = [FE_ONE; COMB_AT_MAX_SLOTS];
 
-    for j in 0..COMB_WINDOWS {
-        let base = COMB_FIRST_BIT + j * COMB_W;
-        for m in 0..COMB_SLOTS {
+    for j in 0..windows {
+        let base = COMB_FIRST_BIT + j * w;
+        for m in 0..slots {
             let mut acc = ge_identity();
             let mut first = true;
-            for b in 0..COMB_W {
+            for b in 0..w {
                 if (m >> b) & 1 == 1 {
                     if first {
                         // Assigning saves an addition against the identity.
@@ -441,8 +618,8 @@ pub fn build_comb_table(comb: &mut [Niels; COMB_LEN], eight: &mut Niels) {
         // One inversion for the whole window: this is the step that makes the
         // entries usable by `ge_madd`.
         batch_invert_into(&mut zs, &mut scratch);
-        for m in 0..COMB_SLOTS {
-            comb[j * COMB_SLOTS + m] = ge_to_niels(&points[m], &zs[m]);
+        for m in 0..slots {
+            comb[j * slots + m] = ge_to_niels(&points[m], &zs[m]);
         }
     }
 
@@ -454,45 +631,109 @@ pub fn build_comb_table(comb: &mut [Niels; COMB_LEN], eight: &mut Niels) {
     *eight = ge_to_niels(&eight_point, &zi);
 }
 
-/// The `COMB_W` scalar bits of window `j`, as a table slot index in
-/// `0..COMB_SLOTS`.
+/// The `W` scalar bits of window `j`, as a table slot index in
+/// `0..2^W`.
 ///
-/// `COMB_W <= 5` bits starting at a bit offset of at most 7 span at most 12
-/// bits, so a 16-bit read is always enough. The high byte is only *used* when
-/// the offset is 7, and then `byte + 1 <= 30`; when `byte == 31` (the top
-/// window) the read wraps to byte 0, lands at bit 5 or above after the shift,
-/// and is discarded by the mask -- so this is in bounds for every window
-/// without a bounds check or a branch.
+/// # Why two bytes are always enough
+///
+/// A window is `W` bits at a bit offset of at most 7, so it spans at most
+/// `W + 7` bits, and `W <= COMB_W_MAX == 9` keeps that inside the 16-bit read.
+/// The high byte is real data exactly when the window does not start in the
+/// scalar's last byte, i.e. when `byte + 1 <= 31`; in that case `byte + 1` is a
+/// genuine index and the read is in bounds.
+///
+/// The only window that starts in byte 31 is the top one, and there the read
+/// wraps to byte 0 -- which is *not* the next window's bits, so it has to be
+/// masked away. It always is. The top window ends at bit 254, so
+/// `base + W - 1 <= 254`; with `byte == 31` meaning `base >= 248` and
+/// `off = base - 248`, that gives
+///
+/// ```text
+///     off + W = (base - 248) + W <= (254 - W + 1 - 248) + W = 7 <= 8
+/// ```
+///
+/// The wrapped byte lands at bit `8 - off` of the shifted value and the mask
+/// keeps only bits `0..W`, so with `off + W <= 7` no bit of the wrap survives.
+/// (The bound is 7, not 8; `comb_top_window_lands_on_bit_254` asserts the looser
+/// `off + W <= 8` so the test does not depend on the tighter derivation.)
+/// `comb_slot_read_is_safe` checks the general per-window condition rather than
+/// trusting this argument to stay true if `COMB_FIRST_BIT` or `COMB_BITS` ever
+/// move.
+///
+/// The consequence worth stating plainly: the top window is *not* truncated or
+/// special-cased anywhere. It is an ordinary `W`-bit window whose last bit is
+/// the scalar's last bit, and clamping's forced bit 254 lands in it like any
+/// other. At the default `W == 4` that means window 62 covers bits 251..=254,
+/// byte 31, offset 3, and its `hi` read wraps to byte 0 and is masked away --
+/// which is the only place in the whole extractor where the read is not real
+/// data, and the arithmetic above is why it still works.
 #[inline(always)]
-fn comb_slot(scalar: &[u8; 32], j: usize) -> usize {
-    let base = COMB_FIRST_BIT + j * COMB_W;
+pub fn comb_slot_w<const W: usize>(scalar: &[u8; 32], j: usize) -> usize {
+    let base = COMB_FIRST_BIT + j * W;
     let byte = base >> 3;
     let off = (base & 7) as u32;
     let lo = scalar[byte] as u32;
     let hi = scalar[(byte + 1) & 31] as u32;
-    (((lo | (hi << 8)) >> off) & (COMB_SLOTS as u32 - 1)) as usize
+    // `slot_mask::<W>()` rather than `(1 << W) - 1` so the mask is a compile
+    // -time constant and the shift does not depend on W being in range.
+    (((lo | (hi << 8)) >> off) & slot_mask::<W>()) as usize
 }
 
-/// `[scalar]B` as a sum of precomputed window subset sums.
+/// The digit mask for a `W`-bit window: `2^W - 1`, as a `u32`.
+#[inline(always)]
+pub const fn slot_mask<const W: usize>() -> u32 {
+    (1u32 << W) - 1
+}
+
+/// `[scalar]B` as a sum of precomputed window subset sums, for any window size.
 ///
-/// `COMB_WINDOWS` point additions and **no doublings**, whatever the scalar
+/// `comb_windows(W)` point additions and **no doublings**, whatever the scalar
 /// looks like -- the operation count is data independent, which is the entire
 /// point (see the divergence note above `COMB_W`).
 ///
-/// The first window is added against the identity rather than assigned, because
-/// the accumulator has to be a `Ge` and a `Niels` cannot be one. `ge_madd` is
-/// unified, so that addition is exact and costs 7M like any other; at the
-/// default `COMB_W == 4` that is 63 additions against the ladder's ~251 per
-/// warp.
-pub fn scalarmult_base_comb(scalar: &[u8; 32], comb: &[Niels; COMB_LEN]) -> Ge {
-    let mut r = ge_madd(&ge_identity(), &comb[comb_slot(scalar, 0)]);
-    for j in 1..COMB_WINDOWS {
-        let addend = comb[j * COMB_SLOTS + comb_slot(scalar, j)];
-        r = ge_madd(&r, &addend);
+/// **Performs no `comb_w_ok` check**: it takes a plain slice so the tests can
+/// drive it at a window size this build rejects, which is the only way to show
+/// that such a size is wrong rather than merely discouraged. Production code
+/// reaches it through [`scalarmult_base_comb`], which is instantiated at
+/// `COMB_W`, and `COMB_W` is validated at compile time. What is checked here
+/// is the one thing that would be a memory error rather than a wrong answer:
+/// the table has to be long enough for the windows to index into.
+pub fn scalarmult_base_comb_w<const W: usize>(scalar: &[u8; 32], comb: &[Niels]) -> Ge {
+    let slots = comb_slots(W);
+    let windows = comb_windows(W);
+    assert!(
+        comb.len() >= windows * slots,
+        "a {W}-bit comb needs a table of {} entries, got {}",
+        windows * slots,
+        comb.len()
+    );
+
+    // The first window is added against the identity rather than assigned,
+    // because the accumulator has to be a `Ge` and a `Niels` cannot be one.
+    // `ge_madd` is unified, so that addition is exact -- and because
+    // `ge_identity` is a compile-time constant, `ptxas` folds it: LLVM peels
+    // window 0 out of the loop and, in the peeled copy, the three multiplies
+    // against the identity's known `1, 1, 0` collapse. Measured in the
+    // generated PTX, the peeled copy has 55 `mul` instructions against the
+    // loop body's 376, so window 0 costs about one field multiply instead of
+    // seven. At the default `W == 4` that is 62 * 7 + 1 = 435 multiplies per
+    // scalar multiplication instead of 441.
+    let mut r = ge_madd(&ge_identity(), &comb[comb_slot_w::<W>(scalar, 0)]);
+    for j in 1..windows {
+        r = ge_madd(&r, &comb[j * slots + comb_slot_w::<W>(scalar, j)]);
     }
     r
 }
 
+/// [`scalarmult_base_comb_w`] at the window size this build uses, against the
+/// fixed-size table the device is handed.
+///
+/// `comb_windows(W)` point additions and **no doublings**, whatever the scalar
+/// looks like. At the default `COMB_W == 4` that is 63 additions against the
+/// ladder's ~251 per warp.
+pub fn scalarmult_base_comb(scalar: &[u8; 32], comb: &[Niels; COMB_LEN]) -> Ge {
+    scalarmult_base_comb_w::<COMB_W>(scalar, comb)
+}
 
 #[cfg(test)]
 mod tests {
@@ -663,10 +904,15 @@ mod tests {
     /// The comb must equal the power-table ladder on arbitrary clamped
     /// scalars -- the cross-check that makes the RFC vectors more than three
     /// lucky coincidences.
-    #[test]
-    fn comb_matches_power_ladder() {
+    fn comb_matches_power_ladder_for_w<const W: usize>() {
         let power = power_table();
-        let comb = comb_table();
+        let mut comb: Vec<Niels> = vec![unsafe { core::mem::zeroed() }; comb_len(W)];
+        let mut eight: Niels = unsafe { core::mem::zeroed() };
+        // Deliberately the unvalidated builder: 6 and 7 are mathematically
+        // correct but rejected by `comb_w_ok` on table size, and this test
+        // exists to show the maths holds there too.
+        build_comb_table_at(W, &mut comb, &mut eight);
+
         let mut rng = Rng(0x1319_8A2E_0370_7344);
         for i in 0..64 {
             let mut scalar = [0u8; 32];
@@ -678,66 +924,438 @@ mod tests {
             scalar[31] &= 63;
             scalar[31] |= 64;
 
-            let got = scalarmult_base_comb(&scalar, &comb);
+            let got = scalarmult_base_comb_w::<W>(&scalar, &comb);
             let want = scalarmult_base_table(&scalar, &power);
             assert_eq!(
                 hex(&compress(&got)),
                 hex(&compress(&want)),
-                "case {} scalar {}",
-                i,
+                "W={W} case {i} scalar {}",
                 hex(&scalar)
             );
         }
     }
 
+    /// The same cross-check at the window size this build was compiled with.
+    #[test]
+    fn comb_matches_power_ladder() {
+        comb_matches_power_ladder_for_w::<COMB_W>();
+    }
+
+    /// And at every window size the comb claims to support. Together with
+    /// `comb_slot_reads_the_right_bits_for_every_window` this makes the whole
+    /// comb path -- extractor, table layout, Niels normalisation, the
+    /// identity slot -- W-parameterised in the test suite, not just in the
+    /// kernel.
+    ///
+    /// 6 and 7 are here even though `comb_w_ok` rejects them, because the
+    /// *maths* is right at those widths and only the table size is not. That
+    /// is worth pinning down: if a future change made a wide window cheaper
+    /// (a shared-memory table, say), these tests are already there.
+    #[test]
+    fn comb_matches_power_ladder_for_every_window() {
+        comb_matches_power_ladder_for_w::<2>();
+        comb_matches_power_ladder_for_w::<3>();
+        comb_matches_power_ladder_for_w::<4>();
+        comb_matches_power_ladder_for_w::<6>();
+        comb_matches_power_ladder_for_w::<7>();
+    }
+
+    /// The RFC vectors through the comb at several window widths. Wider than
+    /// the ladder comparison in value: these are *published* keys, so a match
+    /// pins the whole path to the specification and not merely to itself.
+    #[test]
+    fn comb_rfc8032_vectors_for_every_window() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            ),
+            (
+                "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            ),
+            (
+                "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+                "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            ),
+        ];
+        // Build the three clamped scalars once.
+        let mut scalars: Vec<[u8; 32]> = Vec::new();
+        for (seed_hex, _) in cases.iter() {
+            let seed: Vec<u8> = unhex(seed_hex);
+            let expanded = sha512::sha512(&seed);
+            let mut scalar = [0u8; 32];
+            scalar.copy_from_slice(&expanded[..32]);
+            scalar[0] &= 248;
+            scalar[31] &= 63;
+            scalar[31] |= 64;
+            scalars.push(scalar);
+        }
+
+        // Const-generic, so the window size has to be a literal rather than a
+        // loop variable: the extractor, the table layout and the loop bound all
+        // specialise on it, which is exactly why a width is a compile-time
+        // constant throughout the kernel.
+        macro_rules! at_w {
+            ($w:literal) => {{
+                let mut comb: Vec<Niels> = vec![unsafe { core::mem::zeroed() }; comb_len($w)];
+                let mut eight: Niels = unsafe { core::mem::zeroed() };
+                build_comb_table_at($w, &mut comb, &mut eight);
+                for (i, scalar) in scalars.iter().enumerate() {
+                    let got = scalarmult_base_comb_w::<$w>(scalar, &comb);
+                    assert_eq!(hex(&compress(&got)), cases[i].1, "W={} vector {}", $w, i);
+                }
+            }};
+        }
+        at_w!(2);
+        at_w!(3);
+        at_w!(4);
+        at_w!(6);
+        at_w!(7);
+    }
+
     /// Every comb slot, for every window, must be the subset sum it claims to
     /// be. Checking the table directly catches a mis-indexed build that the
     /// scalar-multiply comparison could hide behind a symmetric mistake.
+    ///
+    /// This one is quadratic in the table size, so it runs at the widths whose
+    /// tables are small enough to be cheap: 1008 slots at W=4, 672 at W=3, 504
+    /// at W=2. At W=6 it would be 2688 and at W=7 4608, and `comb_matches_-
+    /// power_ladder_for_every_window` already covers those widths end to end.
     #[test]
     fn comb_slots_are_subset_sums() {
-        let power = power_table();
-        let comb = comb_table();
-        for j in 0..COMB_WINDOWS {
-            let base = COMB_FIRST_BIT + j * COMB_W;
-            for m in 0..COMB_SLOTS {
-                // Rebuild the slot the slow way, straight from the power table.
-                let mut want = ge_identity();
-                let mut first = true;
-                for b in 0..COMB_W {
-                    if (m >> b) & 1 == 1 {
-                        if first {
-                            want = power[base + b];
-                            first = false;
-                        } else {
-                            want = ge_add(&want, &power[base + b]);
+        for w in [2usize, 3, 4] {
+            let power = power_table();
+            let mut comb: Vec<Niels> = vec![unsafe { core::mem::zeroed() }; comb_len(w)];
+            let mut eight: Niels = unsafe { core::mem::zeroed() };
+            build_comb_table_at(w, &mut comb, &mut eight);
+            for j in 0..comb_windows(w) {
+                let base = COMB_FIRST_BIT + j * w;
+                for m in 0..(1usize << w) {
+                    // Rebuild the slot the slow way, straight from the power table.
+                    let mut want = ge_identity();
+                    let mut first = true;
+                    for b in 0..w {
+                        if (m >> b) & 1 == 1 {
+                            if first {
+                                want = power[base + b];
+                                first = false;
+                            } else {
+                                want = ge_add(&want, &power[base + b]);
+                            }
                         }
                     }
+                    assert_eq!(
+                        hex(&compress(&ge_madd(&ge_identity(), &comb[j * (1 << w) + m]))),
+                        hex(&compress(&want)),
+                        "W={w} window {j} slot {m}"
+                    );
                 }
+            }
+        }
+    }
+
+    /// The identity slot must be the identity, at every width. A zero digit has
+    /// to add nothing at all, which is what lets the window loop run with no
+    /// branch -- and a Niels identity is only valid because `ge_madd` is a
+    /// unified formula.
+    #[test]
+    fn comb_slot_zero_is_the_identity_at_every_window() {
+        for w in [2usize, 3, 4, 6, 7] {
+            let mut comb: Vec<Niels> = vec![unsafe { core::mem::zeroed() }; comb_len(w)];
+            let mut eight: Niels = unsafe { core::mem::zeroed() };
+            build_comb_table_at(w, &mut comb, &mut eight);
+            for j in 0..comb_windows(w) {
+                let zero = comb[j * (1 << w)];
+                // Adding it to a point must be a no-op.
+                let mut p = ge_base();
+                for _ in 0..(j % 7) {
+                    p = ge_add(&p, &ge_eight());
+                }
+                let got = ge_madd(&p, &zero);
                 assert_eq!(
-                    hex(&compress(&ge_madd(&ge_identity(), &comb[j * COMB_SLOTS + m]))),
-                    hex(&compress(&want)),
-                    "window {} slot {}",
-                    j,
-                    m
+                    hex(&compress(&got)),
+                    hex(&compress(&p)),
+                    "W={w} window {j} slot 0 must be the identity"
                 );
             }
         }
     }
 
-    /// `comb_slot` must return exactly the bits the window spans, including at
-    /// the two ends of the scalar where the 16-bit read runs off the end.
-    #[test]
-    fn comb_slot_reads_the_right_bits() {
-        let mut scalar = [0u8; 32];
-        for (i, b) in scalar.iter_mut().enumerate() {
+    /// The digits of window `j` taken straight from the scalar, one bit at a
+    /// time. This is the deliberately naive reading that `comb_slot_w` has to
+    /// agree with, and it is written in terms of `W` so the same oracle serves
+    /// every window size.
+    fn comb_slot_reference(scalar: &[u8; 32], w: usize, j: usize) -> usize {
+        let base = COMB_FIRST_BIT + j * w;
+        (0..w).fold(0usize, |acc, b| {
+            acc | (((scalar[(base + b) >> 3] >> ((base + b) & 7)) & 1) as usize) << b
+        })
+    }
+
+    /// A spread of scalars that between them make the two byte reads interesting:
+    /// a clamped one, an unclamped one, one with every bit set (so the high
+    /// byte is `0xFF` and any spill into it shows up), and one with only the
+    /// forced top bit set.
+    fn extractor_scalars() -> Vec<[u8; 32]> {
+        let mut clamped = [0u8; 32];
+        for (i, b) in clamped.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
-        for j in 0..COMB_WINDOWS {
-            let base = COMB_FIRST_BIT + j * COMB_W;
-            let want = (0..COMB_W).fold(0usize, |acc, b| {
-                acc | (((scalar[(base + b) >> 3] >> ((base + b) & 7)) & 1) as usize) << b
-            });
-            assert_eq!(comb_slot(&scalar, j), want, "window {}", j);
+        clamped[0] &= 248;
+        clamped[31] &= 63;
+        clamped[31] |= 64;
+
+        let mut unclamped = [0u8; 32];
+        for (i, b) in unclamped.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(101).wrapping_add(7);
+        }
+
+        let mut top_only = [0u8; 32];
+        top_only[0] = 0x08;
+        top_only[31] = 0x40;
+
+        // Bit 255 set as well. Clamping forbids it, but the extractor must not
+        // read past bit 254 into it: the reference oracle is the same either
+        // way, so this scalar is a direct check that the top window stops at
+        // 254.
+        let mut over = clamped;
+        over[31] |= 0x80;
+
+        vec![clamped, unclamped, [0xFF; 32], top_only, over]
+    }
+
+    /// The digit extractor must return exactly the bits the window spans, for
+    /// every window, including the two ends of the scalar where the 16-bit read
+    /// runs off the end.
+    fn comb_slot_reads_the_right_bits_for_w<const W: usize>() {
+        for scalar in extractor_scalars().iter() {
+            for j in 0..comb_windows(W) {
+                assert_eq!(
+                    comb_slot_w::<W>(scalar, j),
+                    comb_slot_reference(scalar, W, j),
+                    "W={W} window {j} scalar {}",
+                    hex(scalar)
+                );
+            }
+        }
+    }
+
+    /// The same, at the window size this build was compiled with.
+    #[test]
+    fn comb_slot_reads_the_right_bits() {
+        comb_slot_reads_the_right_bits_for_w::<COMB_W>();
+    }
+
+    /// Every window size the comb claims to support, on the same extractor
+    /// check. This is the test that was missing: the digit extractor, the
+    /// window count and the table layout all depend on `COMB_W`, and before
+    /// this the suite only ever exercised the one value the crate happened to
+    /// be built with, so a sweep could validate a window size only by
+    /// rebuilding and re-running.
+    #[test]
+    fn comb_slot_reads_the_right_bits_for_every_window() {
+        comb_slot_reads_the_right_bits_for_w::<2>();
+        comb_slot_reads_the_right_bits_for_w::<3>();
+        comb_slot_reads_the_right_bits_for_w::<4>();
+        comb_slot_reads_the_right_bits_for_w::<6>();
+        comb_slot_reads_the_right_bits_for_w::<7>();
+    }
+
+    /// The top window is where an off-by-one would hide, because that is the
+    /// only window whose two-byte read wraps. Spell out the two properties
+    /// separately so a failure says which one broke.
+    ///
+    /// 1. *Coverage*: the last window ends at the scalar's last usable bit
+    ///    (254) -- not one bit short of it, and not past it.
+    /// 2. *Wrapping*: if the top window's high byte is a wrap onto byte 0, the
+    ///    mask must discard all of it. `off + W <= 8` is the condition; see
+    ///    `comb_slot_w` for the derivation.
+    #[test]
+    fn comb_top_window_lands_on_bit_254() {
+        for w in [2usize, 3, 4, 6, 7] {
+            assert_eq!(
+                comb_bits_covered(w),
+                COMB_BITS,
+                "W={w} must cover every comb bit",
+                w = w
+            );
+
+            let last_base = COMB_FIRST_BIT + (comb_windows(w) - 1) * w;
+            let last_bit = last_base + w - 1;
+            assert_eq!(
+                last_bit,
+                254,
+                "W={w} top window must end at bit 254",
+                w = w
+            );
+
+            // The wrapped read is masked away.
+            assert!(
+                last_base >= 248,
+                "W={w} top window should start in byte 31, the only byte whose \
+                 successor wraps",
+                w = w
+            );
+            let off = last_base & 7;
+            assert!(
+                off + w <= 8,
+                "W={w} top window wraps onto byte 0 and its bits survive the \
+                 mask (off={off}, w={w})",
+                off = off, w = w
+            );
+
+            // And no window may read past bit 254 at all.
+            for j in 0..comb_windows(w) {
+                let base = COMB_FIRST_BIT + j * w;
+                assert!(
+                    base + w - 1 <= 254,
+                    "W={w} window {j} reads past bit 254",
+                    w = w, j = j
+                );
+                let byte = base >> 3;
+                assert!(
+                    byte + 1 <= 31 || (base & 7) + w <= 8,
+                    "W={w} window {j} reads out of bounds",
+                    w = w, j = j
+                );
+            }
+        }
+    }
+
+    /// Every window size in the documented range, so the extractor and the
+    /// table agree, and the digit extraction is exhaustively correct.
+    #[test]
+    fn comb_slot_read_is_safe() {
+        for w in COMB_W_MIN..=COMB_W_MAX {
+            for j in 0..comb_windows(w) {
+                let base = COMB_FIRST_BIT + j * w;
+                let byte = base >> 3;
+                let off = base & 7;
+                // Two cases, and only two: either `byte + 1` is a real index,
+                // or it wraps and the mask has to save us.
+                if byte + 1 <= 31 {
+                    assert!(byte + 1 <= 31, "W={} window {}", w, j);
+                } else {
+                    assert!(
+                        off + w <= 8,
+                        "W={} window {} wraps and leaks (off={})",
+                        w, j, off
+                    );
+                }
+                // The two-byte read covers bits 0..=15; the window needs
+                // `off..=off + W - 1`. At W=9 and off=7 that is bit 15, the last
+                // bit available -- exactly tight, and the reason
+                // `COMB_W_MAX` is 9.
+                assert!(
+                    off + w <= 16,
+                    "W={} window {} reads past bit 15 of its two-byte read",
+                    w,
+                    j
+                );
+            }
+        }
+    }
+
+    /// `comb_w_ok` is the single definition of "usable". Check it against the
+    /// two properties it is meant to enforce, and pin down the sizes on both
+    /// sides of each boundary so a change to the predicate has to be deliberate.
+    #[test]
+    fn comb_w_ok_matches_its_own_definition() {
+        // Divides 252, and its table fits in L1.
+        for w in [2usize, 3, 4] {
+            assert!(comb_w_ok(w), "W={} should be usable", w);
+        }
+        // Divides 252 (36 windows) but the table is 540 KiB, 4.1x L1.
+        assert!(!comb_w_ok(7), "W=7 cannot fit its table in L1");
+        // Does not divide 252, and the table does not fit either.
+        assert!(!comb_w_ok(5), "W=5 neither tiles 252 nor fits L1");
+        // Out of range at the bottom.
+        assert!(!comb_w_ok(0), "W=0 is meaningless");
+        assert!(!comb_w_ok(1), "W=1 is the ladder, not a comb");
+        // Out of range at the top, and does not tile 252 either.
+        assert!(!comb_w_ok(8), "W=8 does not divide 252");
+    }
+
+    /// The point of the whole exercise: a window size that does not divide 252
+    /// is not a slightly-wrong comb, it is a *different point*.
+    ///
+    /// `COMB_BITS / 5 == 50` windows of 5 bits cover 250 of the 252 bits, so
+    /// integer division drops bits 253 and 254 -- and clamping always sets bit
+    /// 254, so it is dropped on *every single scalar*. This is built with the
+    /// unvalidated builder to make the failure concrete rather than
+    /// hypothetical: a build-time assert on `comb_w_ok` says "don't do this",
+    /// and this says what "this" costs.
+    #[test]
+    fn w5_would_drop_the_top_bits() {
+        assert_eq!(COMB_BITS % 5, 2, "the premise: 5 does not tile 252");
+        assert!(!comb_w_ok(5), "and so it is rejected");
+
+        // Build the W=5 table anyway. Two windows short of a full comb.
+        let mut comb: Vec<Niels> = vec![unsafe { core::mem::zeroed() }; comb_len(5)];
+        let mut eight: Niels = unsafe { core::mem::zeroed() };
+        build_comb_table_at(5, &mut comb, &mut eight);
+
+        // A clamped scalar: bits 3..=254 are all legal, bit 254 forced.
+        let mut scalar = [0u8; 32];
+        for (i, b) in scalar.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(53).wrapping_add(3);
+        }
+        scalar[0] &= 248;
+        scalar[31] &= 63;
+        scalar[31] |= 64;
+        assert_eq!(scalar[31] & 0x40, 0x40, "bit 254 is set, as clamping demands");
+
+        let power = power_table();
+        let got = scalarmult_base_comb_w::<5>(&scalar, &comb);
+        let want = scalarmult_base_table(&scalar, &power);
+        assert_ne!(
+            hex(&compress(&got)),
+            hex(&compress(&want)),
+            "a 5-bit comb must not agree with the ladder -- that is the point"
+        );
+
+        // Pin down *how* it is wrong: clearing bits 253 and 254 from the scalar
+        // has to reproduce the W=5 result exactly. That makes it a dropped-bit
+        // bug rather than a coincidence.
+        let mut truncated = scalar;
+        truncated[31] &= 0x3F; // clear bit 254
+        truncated[31] &= !0x20u8; // clear bit 253
+        assert_eq!(
+            hex(&compress(&scalarmult_base_table(&truncated, &power))),
+            hex(&compress(&got)),
+            "the W=5 comb should equal the ladder over bits 3..=252"
+        );
+    }
+
+    /// The window count must be exact for every usable `W`, and the top window
+    /// must not run off the end of the scalar.
+    #[test]
+    fn comb_window_count_is_exact() {
+        for w in [2usize, 3, 4] {
+            assert_eq!(
+                comb_windows(w) * w,
+                COMB_BITS,
+                "W={w} must tile the comb range exactly",
+                w = w
+            );
+            assert_eq!(
+                comb_len(w),
+                comb_windows(w) * (1 << w),
+                "W={w} table length",
+                w = w
+            );
+            assert_eq!(
+                comb_len(w) * NIELS_BYTES + NIELS_BYTES,
+                comb_table_bytes(w),
+                "W={w} uploaded bytes",
+                w = w
+            );
+            assert!(
+                comb_table_bytes(w) <= COMB_L1_BYTES,
+                "W={w} table must fit L1",
+                w = w
+            );
         }
     }
 

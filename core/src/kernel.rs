@@ -55,9 +55,9 @@ use super::{KernelParams, SLOT_BYTES, SLOTS};
 #[cfg(target_arch = "nvptx64")]
 use super::field::FE_ONE;
 #[cfg(target_arch = "nvptx64")]
-use super::group::{batch_invert_into, COMB_BITS, COMB_LEN, COMB_W};
+use super::group::batch_invert_into;
 #[cfg(target_arch = "nvptx64")]
-use super::{BATCH, BLOCK, CHUNK};
+use super::{BATCH, CHUNK};
 
 /// A match found during a batch.
 #[derive(Copy, Clone)]
@@ -221,6 +221,14 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, base_ptr: *cons
     // Guard the compile-time tunables. A zero or misordered value would make the
     // chunk buffers zero-length and the walk silently do nothing, which looks
     // like a mysteriously slow kernel rather than a bad setting.
+    //
+    // `COMB_W` used to be checked here too. It no longer is: `group.rs` asserts
+    // it at *compile* time, and an `assert!` whose condition is a constant is
+    // not a guard, it is dead code that LLVM folds away. With `T3V_COMB_W=5` the
+    // old check did not fire at build time -- it folded `render` down to four
+    // instructions that call `panic` and trap on the device, which is a
+    // spectacular way to discover a bad build-time flag. The window width, the
+    // 252-bit tiling and the L1 table bound are now build errors.
     assert!(CHUNK > 0, "T3V_CHUNK must be greater than zero");
     assert!(BATCH > 0, "T3V_BATCH must be greater than zero");
     assert!(
@@ -229,9 +237,6 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, base_ptr: *cons
         BATCH,
         CHUNK
     );
-    assert!(COMB_W >= 2 && COMB_W <= 4, "T3V_COMB_W must be in 2..=4");
-    assert!(COMB_BITS % COMB_W == 0, "T3V_COMB_W must divide 252");
-    assert!(COMB_LEN > 0, "the comb table must not be empty");
 
     let tid = unsafe { _block_dim_x() } * unsafe { _block_idx_x() } + unsafe { _thread_idx_x() };
     let tid = tid as u64;

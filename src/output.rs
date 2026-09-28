@@ -242,6 +242,17 @@ impl Sink {
     /// The format is a parameter rather than something derived from `path`, so
     /// any filename works with any format. See [`Sink::open`] for the
     /// extension-inferring convenience wrapper.
+    /// True when `path` is, or will be, a regular file -- and so can be
+    /// fsynced. A path that does not exist yet will be created as a regular
+    /// file; a character device or FIFO never can be.
+    pub fn is_regular_file(path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(m) => m.is_file(),
+            // Not present yet: `File::create` below will make a regular file.
+            Err(_) => true,
+        }
+    }
+
     pub fn open_format(path: &Path, format: Format, durability: Durability) -> io::Result<Self> {
         let file = File::create(path)?;
         let w = BufWriter::with_capacity(1 << 16, file);

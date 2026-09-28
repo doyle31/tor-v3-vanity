@@ -72,14 +72,34 @@ fn resolve_tunables() -> Result<Tunables> {
     };
 
     let mut resolved = Vec::new();
+    let mut overridden = Vec::new();
     for (key, var) in TUNABLES {
         // An explicitly set variable wins, so a one-off experiment needs no
         // edit and cannot be silently clobbered by the file.
         let from_env = env::var(var).ok().filter(|v| !v.is_empty());
         let value = match from_env {
-            Some(v) => v.parse::<usize>().map_err(|_| {
-                format!("{var} is set to {v:?}, which is not a number")
-            })?,
+            Some(v) => {
+                let parsed = v.parse::<usize>().map_err(|_| {
+                    format!("{var} is set to {v:?}, which is not a number")
+                })?;
+                // Say so loudly. The file is now the place a build's settings
+                // are recorded, so an environment variable quietly shadowing it
+                // means the binary does not match the checked-in config -- and
+                // that is exactly how a benchmark ends up measuring something
+                // other than what the repository says.
+                if let Some((_, from_file)) = file_values.iter().find(|(k, _)| *k == key) {
+                    if *from_file != parsed {
+                        overridden.push(format!(
+                            "{var}={parsed} (env) overrides {key} = {from_file} in kernel.conf"
+                        ));
+                    }
+                } else {
+                    overridden.push(format!(
+                        "{var}={parsed} (env) is not recorded in kernel.conf"
+                    ));
+                }
+                parsed
+            }
             None => match file_values.iter().find(|(k, _)| *k == key) {
                 Some((_, v)) => *v,
                 // Absent from both: leave it unset so the device crate's own
@@ -88,6 +108,17 @@ fn resolve_tunables() -> Result<Tunables> {
             },
         };
         resolved.push((var, value));
+    }
+
+    if !overridden.is_empty() {
+        println!("cargo:warning=KERNEL TUNED BY ENVIRONMENT, NOT BY kernel.conf");
+        for line in &overridden {
+            println!("cargo:warning=  {line}");
+        }
+        println!(
+            "cargo:warning=  this build will not match the checked-in config; \
+             unset the variable, or put the value in kernel.conf to make it permanent"
+        );
     }
     Ok(resolved)
 }

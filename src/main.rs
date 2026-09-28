@@ -61,9 +61,18 @@ pub fn pubkey_to_onion(pubkey: &[u8; 32]) -> String {
     onion[..32].clone_from_slice(pubkey);
     onion[32..34].clone_from_slice(&hasher.finalize()[..2]);
     onion[34] = 3;
+    // `Rfc4648Lower`, not `Rfc4648`: base32 0.5 split the alphabet by case, so
+    // `Rfc4648` now emits uppercase and `Rfc4648Lower` emits lowercase. A Tor
+    // address is canonically lowercase, and the old code got there by encoding
+    // uppercase and then calling `.to_lowercase()` -- a second full pass, and a
+    // second String allocation, over every address formatted. Asking for the
+    // lowercase alphabet directly produces the right bytes the first time.
+    //
+    // This is on the per-match path, so the saved allocation is per key found,
+    // not per key examined.
     format!(
         "{}.onion",
-        base32::encode(base32::Alphabet::RFC4648 { padding: false }, &onion).to_lowercase()
+        base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &onion)
     )
 }
 
@@ -77,7 +86,7 @@ pub fn pubkey_to_onion(pubkey: &[u8; 32]) -> String {
 fn to_chrono(secs: f64) -> chrono::Duration {
     const MAX_SECS: f64 = 9.0e9; // ~285 years, inside chrono's range
     chrono::Duration::from_std(Duration::from_secs_f64(secs.clamp(0.0, MAX_SECS)))
-        .unwrap_or_else(|_| chrono::Duration::max_value())
+        .unwrap_or_else(|_| chrono::Duration::MAX)
 }
 
 /// Reject bad build-time tunables here, on the main thread, with a message
@@ -253,8 +262,9 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             // Every search thread is gone; nothing more can arrive.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        let esk = ed25519_dalek::ExpandedSecretKey::from_bytes(&expanded[..]).unwrap();
-        let pk: ed25519_dalek::PublicKey = (&esk).into();
+        let signing_key =
+            ed25519_dalek::SigningKey::from_bytes(&expanded[..32].try_into().unwrap());
+        let pk = ed25519_dalek::VerifyingKey::from(&signing_key);
         let onion = pubkey_to_onion(pk.as_bytes());
 
         // Several threads can match the same prefix in one launch, and they all
@@ -269,7 +279,7 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         println!("{}", onion);
         sink.write(&output::Key {
             onion: onion.clone(),
-            expanded: esk.to_bytes(),
+            expanded,
             matched,
         })
         .unwrap();
@@ -293,4 +303,3 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         eprintln!("error closing output: {}", e);
     }
 }
-

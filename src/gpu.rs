@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use failure::Error;
+use anyhow::Result;
 use tor_v3_vanity_core as core;
 
 /// Default threads per block, from `kernel.conf` via `build.rs`.
@@ -85,13 +85,34 @@ impl BytePrefixOwned {
             s.len(),
             s
         );
+        // `Rfc4648Lower`, not `Rfc4648`: base32 0.5 made the two alphabets
+        // case-specific, and `Rfc4648` now rejects lowercase outright with a
+        // `None` rather than decoding it. Prefixes reach here already
+        // lowercased by `cli::parse`, so this is the matching alphabet. With
+        // the uppercase one every prefix decode returns `None` and every
+        // search silently finds nothing.
         let byte_prefix = base32::decode(
-            base32::Alphabet::RFC4648 { padding: false },
+            base32::Alphabet::Rfc4648Lower { padding: false },
             &format!("{}aa", s),
         )
         .expect("prefix must be base32");
-        let mut last_byte_idx = 5 * s.len() / 8 - 1;
-        let n_bits = (5 * s.len()) % 8;
+        // Which bytes of the encoding a prefix of `s` actually constrains, and
+        // how much of the final one.
+        //
+        // `5 * len` bits are pinned, so they span `ceil(5 * len / 8)` bytes and
+        // the last of those is the only one that may be partial. That is the
+        // last byte index. The previous spelling, `5 * len / 8 - 1` followed by
+        // an increment when the mask was nonzero, is the same value for every
+        // length except one: at `len == 1` it computes `0 - 1` and underflows
+        // a `usize`. A release build only got the right answer because the
+        // underflow wrapped to `usize::MAX` and the increment wrapped it back
+        // to `0`; a debug build, and any caller that does arithmetic on it, sees
+        // a panic. `div_ceil` states the intent and has no wraparound to rely
+        // on -- the prefix length is already known to be at least 1, so the
+        // result is 0 or greater.
+        let bits = 5 * s.len();
+        let n_bits = bits % 8;
+        let last_byte_idx = bits.div_ceil(8) - 1;
         // When 5*len is a whole number of bytes (len 8, 16, ...) the last byte is
         // used in full, so the mask must select all 8 of its bits. Leaving it
         // zero degenerates the comparison to `0 == slice[i]`, which holds for
@@ -102,9 +123,6 @@ impl BytePrefixOwned {
         } else {
             ((1 << n_bits) - 1) << (8 - n_bits)
         };
-        if last_byte_mask > 0 {
-            last_byte_idx += 1;
-        }
         debug_assert!(last_byte_idx < 8);
         let prefix_word = core::BytePrefix::pack_prefix_word(&byte_prefix);
         let gpu_byte_prefix = rustacuda::memory::DeviceBuffer::from_slice(&byte_prefix).unwrap();
@@ -143,7 +161,7 @@ fn assert_crypto_rng<Rng: rand::CryptoRng>(rng: Rng) -> Rng {
 /// The kernel needs these to avoid recomputing the base-point ladder for every
 /// candidate key. `BaseTables` is the fixed-window comb over the scalar's bits
 /// (every window's subset sums, in Niels form) plus the walk step `8B`.
-fn upload_base_tables() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
+fn upload_base_tables() -> Result<rustacuda::memory::DeviceBuffer<u64>> {
     use core::group::{build_comb_table, BaseTables, BASE_TABLE_WORDS};
 
     // `BaseTables` is `#[repr(C)]` and contains nothing but `[u64; 5]`, so it has
@@ -174,7 +192,7 @@ pub fn start(
     tries_sender: crossbeam_channel::Sender<u64>,
     stop: Option<Arc<AtomicBool>>,
     launch: Launch,
-) -> Result<(Dropped, Vec<std::thread::JoinHandle<()>>), Error> {
+) -> Result<(Dropped, Vec<std::thread::JoinHandle<()>>)> {
     use rustacuda::launch;
     use rustacuda::memory::DeviceBox;
     use rustacuda::prelude::*;
@@ -193,7 +211,7 @@ pub fn start(
         let stop = stop.clone();
         workers.push(std::thread::spawn(move || {
             use rand::RngCore;
-            let mut csprng = assert_crypto_rng(rand::thread_rng());
+            let mut csprng = assert_crypto_rng(rand::rng());
             let _context =
                 Context::create_and_push(ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)
                     .unwrap();
@@ -480,20 +498,21 @@ mod prefix_tests {
     fn compare(prefix: &str, data: &[u8; 32]) -> bool {
         let padded = format!("{}aa", prefix);
         let byte_prefix = base32::decode(
-            base32::Alphabet::RFC4648 { padding: false },
+            base32::Alphabet::Rfc4648Lower { padding: false },
             &padded,
         )
         .expect("base32");
-        let mut last_byte_idx = 5 * prefix.len() / 8 - 1;
-        let n_bits = (5 * prefix.len()) % 8;
+        // Must stay in step with the same computation in
+        // `BytePrefixOwned::from_str`; this is a hand-copied stand-in for it
+        // because that one needs a CUDA context to allocate its device buffers.
+        let bits = 5 * prefix.len();
+        let n_bits = bits % 8;
+        let last_byte_idx = bits.div_ceil(8) - 1;
         let last_byte_mask = if n_bits == 0 {
             0xFF
         } else {
             ((1 << n_bits) - 1) << (8 - n_bits)
         };
-        if last_byte_mask > 0 {
-            last_byte_idx += 1;
-        }
         data.starts_with(&byte_prefix[..last_byte_idx])
             && data[last_byte_idx] & last_byte_mask == byte_prefix[last_byte_idx]
     }
@@ -502,7 +521,7 @@ mod prefix_tests {
     fn expected_bytes(prefix: &str) -> [u8; 32] {
         let padded = format!("{}aa", prefix);
         let decoded = base32::decode(
-            base32::Alphabet::RFC4648 { padding: false },
+            base32::Alphabet::Rfc4648Lower { padding: false },
             &padded,
         )
         .expect("base32");
@@ -536,17 +555,25 @@ mod prefix_tests {
         for len in 1..=12usize {
             let prefix = "a".repeat(len);
             let want = expected_bytes(&prefix);
-            let n_bits = (5 * len) % 8;
+            // Same computation as `BytePrefixOwned::from_str`: a prefix pins
+            // `5 * len` bits, spanning `ceil(5 * len / 8)` bytes, the last of
+            // which is partial unless `5 * len` is a whole number of bytes.
+            //
+            // This was previously written as `if mask != 0 { 5 * len / 8 } else
+            // { 5 * len / 8 - 1 }`, which inverts the condition -- a full-width
+            // mask is precisely the whole-byte case, so len 8 computed the last
+            // index as 5 instead of 4. That then demanded the comparison reject
+            // a flip in byte 5, which an 8-character prefix does not constrain,
+            // so the assertion failed on a case that is supposed to match. The
+            // test was wrong about the code, not the reverse.
+            let bits = 5 * len;
+            let n_bits = bits % 8;
             let mask: u8 = if n_bits == 0 {
                 0xFF
             } else {
                 ((1 << n_bits) - 1) << (8 - n_bits)
             };
-            let last_idx = if mask != 0 {
-                5 * len / 8
-            } else {
-                5 * len / 8 - 1
-            };
+            let last_idx = bits.div_ceil(8) - 1;
             for byte in 0..=last_idx {
                 // Bytes before the last are compared in full; the last only
                 // through its mask.

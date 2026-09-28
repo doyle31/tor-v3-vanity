@@ -296,23 +296,32 @@ mod tests {
     /// The `last_byte_idx` / `last_byte_mask` the host derives from a prefix of
     /// `l` base32 characters, copied from `BytePrefixOwned::from_str`.
     ///
-    /// Two details of that derivation matter and are reproduced exactly:
-    /// `5 * l / 8 - 1` underflows for `l == 1` and is only correct because the
-    /// partial-byte correction below adds one straight back (the host ships
-    /// release, so the wrap is invisible), and `n_bits == 0` -- a whole number
-    /// of bytes -- leaves the mask at zero and the index *not* incremented, so
-    /// the final byte is compared in full.
+    /// A prefix pins `5 * l` bits, so it spans `ceil(5 * l / 8)` bytes and the
+    /// last of them is partial unless `5 * l` is a whole number of bytes. The
+    /// host derives that as `bits.div_ceil(8) - 1` with a full `0xFF` mask in the
+    /// whole-byte case, and these tests are the device crate's only record of
+    /// what the host passes down, so they have to track it exactly.
+    ///
+    /// This used to reproduce the older host arithmetic, `5 * l / 8 - 1`
+    /// followed by an increment whenever the mask was nonzero. That had two
+    /// faults, and this helper faithfully carried both:
+    ///
+    /// * at `l == 1` the subtraction underflowed, so the increment panicked in a
+    ///   debug build -- these four tests could not run at all;
+    /// * a full-width mask is exactly the whole-byte case, so making that mask
+    ///   `0xFF` (the fix for 8-character prefixes matching nothing) also tripped
+    ///   the increment and pushed the index one byte past the prefix.
+    ///
+    /// `div_ceil` has neither wraparound nor a special case to get backwards.
     fn host_idx_mask(l: usize) -> (usize, u8) {
-        let mut last_byte_idx = (5 * l / 8).wrapping_sub(1);
-        let n_bits = (5 * l) % 8;
+        let bits = 5 * l;
+        let n_bits = bits % 8;
+        let last_byte_idx = bits.div_ceil(8) - 1;
         let last_byte_mask = if n_bits == 0 {
-            0
+            0xFF
         } else {
             ((1u8 << n_bits) - 1) << (8 - n_bits)
         };
-        if last_byte_mask > 0 {
-            last_byte_idx += 1;
-        }
         (last_byte_idx, last_byte_mask)
     }
 
@@ -347,7 +356,7 @@ mod tests {
             (3, 0x80),        // 5 chars, 25 bits: bytes 0-2, byte 3 high 1
             (3, 0xFC),        // 6 chars, 30 bits: bytes 0-2, byte 3 high 6
             (4, 0xE0),        // 7 chars, 35 bits: bytes 0-3, byte 4 high 3
-            (4, 0x00),        // 8 chars, 40 bits: bytes 0-4 in full
+            (4, 0xFF),        // 8 chars, 40 bits: bytes 0-4 in full
             (5, 0xF8),        // 9 chars, 45 bits: bytes 0-4, byte 5 high 5
             (6, 0xC0),        // 10 chars, 50 bits: bytes 0-5, byte 6 high 2
             (6, 0xFE),        // 11 chars, 55 bits: bytes 0-5, byte 6 high 7

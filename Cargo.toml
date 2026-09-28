@@ -2,7 +2,7 @@
 name = "tor-v3-vanity"
 version = "0.1.0"
 authors = ["Aiden McClelland <me@drbonez.dev>"]
-edition = "2018"
+edition = "2021"
 description = "A TOR v3 vanity url generator designed to run on an nvidia GPU."
 license = "MIT"
 repository = "https://github.com/dr-bonez/tor-v3-vanity"
@@ -23,15 +23,14 @@ path = "src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-base32 = "0.4.0"
-chrono = "0.4.13"
-clap = "2.33.1"
-crossbeam-channel = "0.4.3"
-ed25519-dalek = "1.0.0-pre.4"
-failure = "0.1.8"
-libc = "0.2.74"
-rand = "0.7.3"
-rustacuda = "0.1.2"
-sha3 = "0.9.1"
+base32 = "0.5"
+chrono = "0.4"
+clap = "4"
+crossbeam-channel = "0.5"
+ed25519-dalek = "2"
+anyhow = "1"
+libc = "0.2"
+rand = "0.9"
+rustacuda = "0.1"
+sha3 = "0.10"
 tor-v3-vanity-core = { version = "0.1.0", path = "./core" }
-

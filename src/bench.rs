@@ -106,7 +106,7 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> f64 {
 
     for rep in 1..=reps {
         let mut seed = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let mut x = u32::from_le_bytes(seed);
         let prefix: String = (0..len)
             .map(|_| {

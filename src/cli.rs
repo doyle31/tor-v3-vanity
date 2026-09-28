@@ -19,6 +19,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::{builder::PossibleValuesParser, Arg, ArgAction, Command};
+
 use crate::output;
 
 /// What the program was asked to do.
@@ -62,28 +64,29 @@ pub struct Options {
 pub fn parse() -> Options {
     let m = app().get_matches();
 
-    let benchmarking = m.is_present("bench") || m.is_present("bench-prefix");
-    let match_enabled = if m.is_present("no-match") {
+    let benchmarking = m.get_one::<String>("bench").is_some()
+        || m.get_one::<String>("bench-prefix").is_some();
+    let match_enabled = if m.get_flag("no-match") {
         false
-    } else if m.is_present("match") {
+    } else if m.get_flag("match") {
         true
     } else {
         !benchmarking
     };
 
     let secs: u64 = m
-        .value_of("bench")
+        .get_one::<String>("bench")
         .map(|s| s.parse().expect("--bench takes a number of seconds"))
         .unwrap_or(30);
-    let reps: usize = match m.value_of("reps") {
+    let reps: usize = match m.get_one::<String>("reps") {
         Some(r) => r.parse().expect("--reps takes a count"),
-        None if m.is_present("quick") => 1,
+        None if m.get_flag("quick") => 1,
         None => 3,
     };
 
     // `--bench-prefix` wins over `--bench`: it is the more specific request, and
     // `--bench` doubles as its duration.
-    let mode = match m.value_of("bench-prefix") {
+    let mode = match m.get_one::<String>("bench-prefix") {
         Some(len) => {
             let len: usize = len
                 .parse()
@@ -102,7 +105,7 @@ pub fn parse() -> Options {
             // on, use the prefix the caller gave, defaulting to a single
             // character so there is something to match against.
             prefixes: if match_enabled {
-                vec![m.value_of("PREFIX").unwrap_or("z").to_string()]
+                vec![m.get_one::<String>("PREFIX").unwrap_or(&"z".to_string()).to_string()]
             } else {
                 vec![]
             },
@@ -110,8 +113,8 @@ pub fn parse() -> Options {
         None => Mode::Search,
     };
 
-    let out = m.value_of("out").map(PathBuf::from);
-    let format = m.value_of("format").map(|name| {
+    let out = m.get_one::<String>("out").map(PathBuf::from);
+    let format = m.get_one::<String>("format").map(|name| {
         output::Format::parse(name).unwrap_or_else(|| {
             panic!(
                 "unknown --format {:?}; expected one of {}",
@@ -124,17 +127,27 @@ pub fn parse() -> Options {
         eprintln!("warning: --format has no effect without --out; using per-key files");
     }
 
+    // A Tor v3 address is canonically lowercase, and every consumer of a prefix
+    // assumes it: the kernel packs the prefix bits into a base32-decoded byte
+    // word, and `main` re-verifies a match with `onion.starts_with(prefix)`.
+    // So an uppercase `AB` would decode fine but could never match the
+    // lowercase address it names, and the search would run forever finding
+    // nothing. Normalise once, here, where the module's own rule puts
+    // resolution, and every downstream value is lowercase by construction.
+    let prefixes: Vec<String> = m
+        .get_many::<String>("PREFIX")
+        .map(|v| v.map(|s| s.to_ascii_lowercase()).collect())
+        .unwrap_or_default();
+    // `longest` is measured after normalisation, so it is a character count of
+    // what will actually be searched rather than of what was typed.
+    let longest = prefixes.iter().map(|s| s.len()).max().unwrap_or(0);
     // Durability follows the longest prefix unless overridden. The reasoning is
     // in `output::Durability`: an fsync per key is ruinous at thousands of
     // matches per second and free at a handful, and the long searches are both
     // the ones worth protecting and the ones where it is cheap.
-    let longest = m
-        .values_of("PREFIX")
-        .map(|v| v.map(|s| s.len()).max().unwrap_or(0))
-        .unwrap_or(0);
-    let durability = if m.is_present("no-fsync") {
+    let durability = if m.get_flag("no-fsync") {
         output::Durability::Buffered
-    } else if m.is_present("fsync") {
+    } else if m.get_flag("fsync") {
         output::Durability::Durable
     } else {
         output::Durability::for_prefix_len(longest)
@@ -142,139 +155,141 @@ pub fn parse() -> Options {
 
     Options {
         mode,
-        prefixes: m
-            .values_of("PREFIX")
-            .map(|v| v.map(|s| s.to_string()).collect())
-            .unwrap_or_default(),
+        prefixes,
         out,
         format,
-        dst: m.value_of("dst").map(PathBuf::from),
-        log_interval: match m.value_of("log-interval") {
+        dst: m.get_one::<String>("dst").map(PathBuf::from),
+        log_interval: match m.get_one::<String>("log-interval") {
             Some(v) => Duration::from_secs(v.parse().expect("--log-interval takes seconds")),
             None => Duration::from_secs(30),
         },
-        verbose: m.is_present("verbose"),
+        verbose: m.get_flag("verbose"),
         threads: m
-            .value_of("threads")
+            .get_one::<String>("threads")
             .map(|t| t.parse().expect("--threads takes a count")),
         blocks_per_sm: m
-            .value_of("blocks-per-sm")
+            .get_one::<String>("blocks-per-sm")
             .map(|p| p.parse().expect("--blocks-per-sm takes a count")),
-        durability: durability,
+        durability,
     }
 }
 
-fn app() -> clap::App<'static, 'static> {
-    clap::App::new("t3v")
+fn app() -> Command {
+    Command::new("t3v")
         .arg(
-            clap::Arg::with_name("PREFIX")
-                .required_unless_one(&["bench", "bench-prefix"])
-                .multiple(true)
-                .value_delimiter(",")
+            Arg::new("PREFIX")
+                .required_unless_present_any(["bench", "bench-prefix"])
+                .action(ArgAction::Append)
+                .value_delimiter(',')
                 .help("Desired prefix"),
         )
         // --- where matches go -------------------------------------------------
         .arg(
-            clap::Arg::with_name("dst")
+            Arg::new("dst")
                 .long("dst")
-                .short("d")
-                .takes_value(true)
+                .short('d')
+                .num_args(1)
                 .help("Destination folder for per-key files (default: cwd)"),
         )
         .arg(
-            clap::Arg::with_name("out")
+            Arg::new("out")
                 .long("out")
-                .short("o")
-                .takes_value(true)
+                .short('o')
+                .num_args(1)
                 .help("Write every match to this single file instead of many small ones"),
         )
         .arg(
-            clap::Arg::with_name("format")
+            Arg::new("format")
                 .long("format")
-                .short("f")
-                .takes_value(true)
-                .possible_values(output::Format::NAMES)
+                .short('f')
+                .num_args(1)
+                .value_parser(PossibleValuesParser::new(output::Format::NAMES))
                 .help("Encoding for --out. Defaults to the file extension, else csv. \
                        Setting it explicitly lets any filename hold any format"),
         )
         // --- what the kernel does ---------------------------------------------
         .arg(
-            clap::Arg::with_name("match")
+            Arg::new("match")
                 .long("match")
+                .action(ArgAction::SetTrue)
                 .help("Check candidates against the prefix (default). The kernel \
                        skips compression and the batch inversion when this is off"),
         )
         .arg(
-            clap::Arg::with_name("no-match")
+            Arg::new("no-match")
                 .long("no-match")
+                .action(ArgAction::SetTrue)
                 .help("Only generate keys; never test them against a prefix"),
         )
         // --- benchmarking ------------------------------------------------------
         .arg(
-            clap::Arg::with_name("bench")
+            Arg::new("bench")
                 .long("bench")
-                .short("b")
-                .takes_value(true)
+                .short('b')
+                .num_args(1)
                 .help("Benchmark for this many seconds, then exit (default 30). \
                        Implies --no-match; pass --match to include matching"),
         )
         .arg(
-            clap::Arg::with_name("bench-prefix")
+            Arg::new("bench-prefix")
                 .long("bench-prefix")
-                .takes_value(true)
+                .num_args(1)
                 .help("Benchmark end-to-end for an N-character prefix: the number \
                        that actually matters, keys *found* per second"),
         )
         .arg(
-            clap::Arg::with_name("reps")
+            Arg::new("reps")
                 .long("reps")
-                .short("r")
-                .takes_value(true)
+                .short('r')
+                .num_args(1)
                 .help("Benchmark repetitions, best is reported (default 3, or 1 \
                        with --quick)"),
         )
         .arg(
-            clap::Arg::with_name("quick")
+            Arg::new("quick")
                 .long("quick")
-                .short("Q")
+                .short('Q')
+                .action(ArgAction::SetTrue)
                 .help("With a benchmark, do a single timed run"),
         )
         // --- logging -----------------------------------------------------------
         .arg(
-            clap::Arg::with_name("log-interval")
+            Arg::new("log-interval")
                 .long("log-interval")
-                .short("L")
-                .takes_value(true)
+                .short('L')
+                .num_args(1)
                 .help("Seconds between progress lines during a search (default 30, \
                        0 to silence)"),
         )
         .arg(
-            clap::Arg::with_name("verbose")
+            Arg::new("verbose")
                 .long("verbose")
-                .short("v")
+                .short('v')
+                .action(ArgAction::SetTrue)
                 .help("Print the resolved configuration: launch geometry, register \
                        usage, matching, and output format"),
         )
         // --- launch geometry ---------------------------------------------------
         .arg(
-            clap::Arg::with_name("threads")
+            Arg::new("threads")
                 .long("threads")
-                .short("t")
-                .takes_value(true)
+                .short('t')
+                .num_args(1)
                 .help("Threads per block. Default: derived from the kernel's register \
                        usage, which is what actually limits occupancy"),
         )
         .arg(
-            clap::Arg::with_name("blocks-per-sm")
+            Arg::new("blocks-per-sm")
                 .long("blocks-per-sm")
-                .short("p")
-                .takes_value(true)
+                .short('p')
+                .num_args(1)
                 .help("Blocks per SM to launch. Default: fill the device"),
         )
         // --- durability -------------------------------------------------------
         .arg(
-            clap::Arg::with_name("fsync")
+            Arg::new("fsync")
                 .long("fsync")
+                .action(ArgAction::SetTrue)
                 .help("fsync every key, so it survives a crash or power loss. \
                        The default already follows the prefix length: on for 5 \
                        characters and longer, where a key arrives every few \
@@ -282,8 +297,9 @@ fn app() -> clap::App<'static, 'static> {
                        keys arrive thousands per second and it is not"),
         )
         .arg(
-            clap::Arg::with_name("no-fsync")
+            Arg::new("no-fsync")
                 .long("no-fsync")
+                .action(ArgAction::SetTrue)
                 .help("Buffer output even for long prefixes, trading durability \
                        for throughput"),
         )

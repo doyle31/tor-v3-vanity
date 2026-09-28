@@ -616,12 +616,22 @@ mod tests {
         for l in 1..=crate::BytePrefix::MAX_PREFIX_CHARS {
             // Build a prefix from one key, the way the host does: the key's
             // first bytes with the bits the partial mask clears zeroed.
-            let mut last_byte_idx = (5 * l / 8) - 1;
-            let n_bits = (5 * l) % 8;
-            let last_byte_mask = ((1u8 << n_bits) - 1) << (8 - n_bits);
-            if last_byte_mask > 0 {
-                last_byte_idx += 1;
-            }
+            //
+            // Same derivation as `tests::host_idx_mask` and as
+            // `BytePrefixOwned::from_str`: `5 * l` pinned bits span
+            // `ceil(5 * l / 8)` bytes, the last partial unless `5 * l` is a
+            // whole number of bytes, in which case the mask is `0xFF`. The
+            // previous `5 * l / 8 - 1` plus conditional increment underflowed
+            // at `l == 1` and produced a zero mask for whole-byte lengths, so
+            // this test aborted before reaching most of its cases.
+            let bits = 5 * l;
+            let n_bits = bits % 8;
+            let last_byte_idx = bits.div_ceil(8) - 1;
+            let last_byte_mask = if n_bits == 0 {
+                0xFF
+            } else {
+                ((1u8 << n_bits) - 1) << (8 - n_bits)
+            };
             let mut slice = keys[0].0[..last_byte_idx + 1].to_vec();
             slice[last_byte_idx] &= last_byte_mask;
             assert!(last_byte_idx < 8, "prefix of {} must fit the word", l);

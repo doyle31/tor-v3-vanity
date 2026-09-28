@@ -222,9 +222,24 @@ fn build_kernel(tunables: &Tunables) -> Result<PathBuf> {
         other => return Err(format!("unsupported T3V_PTX_PROFILE `{other}`").into()),
     };
 
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut cmd = Command::new(cargo);
-    cmd.arg("rustc")
+    // The device crate is compiled for `nvptx64-nvidia-cuda`, which requires
+    // nightly (`#![feature(abi_ptx, stdarch_nvptx)]`). The host crate builds
+    // with stable, so the nested command must force nightly itself.
+    //
+    // Invoke the `rustup` proxy with a `+nightly` argument rather than
+    // `env::var("CARGO")`. Cargo sets `CARGO` to the real cargo binary, which
+    // may be a plain binary rather than a proxy -- `--version` here reports
+    // 1.97.1 for a `+nightly` request, i.e. it silently ignored the toolchain
+    // directive and produced a confusing `#![feature] may not be used on the
+    // stable release channel` from the device crate. Going through `rustup`
+    // makes the toolchain an explicit argument to something that understands
+    // it. If `rustup` is not on PATH the build fails loudly here, which is
+    // correct: there is no other way to get nightly.
+    let mut cmd = Command::new("rustup");
+    cmd.arg("run")
+        .arg("nightly")
+        .arg("cargo")
+        .arg("rustc")
         .arg("--manifest-path")
         .arg(crate_dir.join("Cargo.toml"))
         .arg("--target")
@@ -245,6 +260,16 @@ fn build_kernel(tunables: &Tunables) -> Result<PathBuf> {
     if let Ok(flags) = env::var("T3V_PTX_RUSTFLAGS") {
         cmd.env("RUSTFLAGS", flags);
     }
+
+    // The parent cargo exports `RUSTC` pointing at the *host* toolchain's rustc
+    // -- stable, when the host is being built with stable. `rustup run` puts
+    // nightly on PATH but does not override an already-set `RUSTC`, so the
+    // nested nightly cargo would faithfully invoke the stable rustc and the
+    // device crate's `#![feature(abi_ptx, ...)]` would be rejected with
+    // E0554. Clearing it lets the toolchain selected above actually be used.
+    cmd.env_remove("RUSTC");
+    cmd.env_remove("RUSTC_WRAPPER");
+    cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
 
     // The tunables have to reach *both* compilations, from the same source.
     //

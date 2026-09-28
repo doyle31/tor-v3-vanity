@@ -5,7 +5,9 @@
 //!
 //! Per candidate key:
 //!
-//!     seed -> SHA-512 -> [h]B -> compress
+//! ```text
+//! seed -> SHA-512 -> [h]B -> compress
+//! ```
 //!
 //! The scalar multiplication dominates. `ed25519-compact`'s
 //! `ge_scalarmult_base` is a plain double-and-add over all 256 bits, so it
@@ -40,13 +42,20 @@
 //! Net effect per candidate: one point addition plus `1/CHUNK` of an
 //! inversion, versus 512 point additions plus a full inversion.
 
-use super::field::{fe_invert, fe_mul, fe_sub, Fe, FE_ONE};
-use super::group::{
-    batch_invert_into, ge_add, ge_base, ge_double, ge_to_bytes_with_zi,
-    scalarmult_base_table, Ge, TABLE_LEN,
-};
+// Imports used by `BatchState` and the batch maths, which compile for both
+// the device and the host (the latter so the unit tests can exercise them).
+use super::field::Fe;
+use super::group::{ge_add, ge_base, ge_double, ge_to_bytes_with_zi, scalarmult_base_table, Ge};
 use super::sha512::sha512;
-use super::{BytePrefix, KernelParams, BATCH, BLOCK, CHUNK};
+use super::{BytePrefix, KernelParams};
+
+// Used only by the `render` entry point, which is device-only.
+#[cfg(target_arch = "nvptx64")]
+use super::field::{fe_invert, fe_mul, fe_sub, FE_ONE};
+#[cfg(target_arch = "nvptx64")]
+use super::group::{batch_invert_into, TABLE_LEN};
+#[cfg(target_arch = "nvptx64")]
+use super::{BATCH, BLOCK, CHUNK};
 
 /// Most matches a single thread will buffer. Matches are rare (roughly one
 /// per 2^(5*prefix_len)), so this only guards against pathological filters.
@@ -273,7 +282,9 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, table_ptr: *con
 /// Add a 64-bit delta to a 32-byte little-endian integer, without clamping.
 ///
 /// Gives each thread in the block a distinct starting seed, so the launch
-/// covers `BATCH * BLOCK` distinct candidate keys.
+/// covers `BATCH * BLOCK` distinct candidate keys. Only the device entry point
+/// needs it; the host build keeps it alive for the tests below.
+#[cfg_attr(not(test), allow(dead_code))]
 fn add_u256(v: &mut [u8; 32], delta: u64) {
     let mut carry = delta;
     for byte in v.iter_mut() {
@@ -289,12 +300,17 @@ fn add_u256(v: &mut [u8; 32], delta: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(dead_code)]
+    use super::add_u256;
     #[allow(unused_imports)]
     use std::vec::Vec;
     #[allow(unused_imports)]
     use std::string::String;
-    use crate::field::{fe_is_negative, fe_to_bytes};
-    use crate::group::TABLE_LEN;
+    // `render` is device-only, so its imports are cfg'd to the device build.
+    // The tests below exercise the same maths, so pull in the ones they need.
+    use crate::field::{fe_invert, FE_ONE};
+    use crate::group::{batch_invert_into, TABLE_LEN};
+    use crate::{BATCH, CHUNK};
 
     fn table() -> [Ge; TABLE_LEN] {
         let zero = Ge {

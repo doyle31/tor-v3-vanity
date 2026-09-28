@@ -6,6 +6,8 @@ use failure::Error;
 use sha3::{Digest, Sha3_256};
 use tor_v3_vanity_core as core;
 
+pub mod output;
+
 pub struct Pubkey(pub [u8; 32]);
 impl AsRef<[u8; 32]> for Pubkey {
     fn as_ref(&self) -> &[u8; 32] {
@@ -255,8 +257,6 @@ pub fn cuda_try_loop(
     Ok(())
 }
 
-const FILE_PREFIX: &'static [u8] = b"== ed25519v1-secret: type0 ==\0\0\0";
-
 fn main() {
     let app = clap::App::new("t3v")
         .arg(
@@ -271,7 +271,23 @@ fn main() {
                 .long("dst")
                 .short("d")
                 .takes_value(true)
-                .help("Destination folder"),
+                .help("Destination folder for per-key files (default: cwd)"),
+        )
+        .arg(
+            clap::Arg::with_name("out")
+                .long("out")
+                .short("o")
+                .takes_value(true)
+                .help("Write every match to this single file instead of many small ones"),
+        )
+        .arg(
+            clap::Arg::with_name("format")
+                .long("format")
+                .short("f")
+                .takes_value(true)
+                .possible_values(output::Format::NAMES)
+                .help("Encoding for --out. Defaults to the file extension, else csv. \
+                       Setting it explicitly lets any filename hold any format"),
         );
     let matches = app.get_matches();
 
@@ -284,11 +300,36 @@ fn main() {
         .unwrap()
         .map(|a| a.to_string())
         .collect();
-    let dst = matches
-        .value_of("dst")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    assert!(dst.is_dir(), "dst must be a directory");
+
+    // An explicit --format always wins. The file extension is only a fallback,
+    // so `--out keys` and `--out keys.dat` both work.
+    let format = matches.value_of("format").map(|name| {
+        output::Format::parse(name)
+            .unwrap_or_else(|| panic!("unknown --format {:?}; expected one of {}", name,
+                                      output::Format::NAMES.join(", ")))
+    });
+    if format.is_some() && matches.value_of("out").is_none() {
+        eprintln!("warning: --format has no effect without --out; using per-key files");
+    }
+
+    // One of two sinks: a single consolidated file, or a directory of per-key
+    // Tor key files.
+    let mut sink = match matches.value_of("out") {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            let chosen = format.unwrap_or_else(|| output::Format::from_path(&path));
+            eprintln!("Writing matches to {} ({})", path.display(), chosen.name());
+            output::Sink::open_format(&path, chosen).unwrap()
+        }
+        None => {
+            let dst = matches
+                .value_of("dst")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            assert!(dst.is_dir(), "dst must be a directory");
+            output::Sink::dir(&dst)
+        }
+    };
 
     let (send, recv) = crossbeam_channel::unbounded();
     let (send_tries, recv_tries) = crossbeam_channel::bounded(1);
@@ -321,8 +362,6 @@ fn main() {
     });
 
     loop {
-        use std::io::Write;
-
         // The kernel returns the 64-byte expanded key, so the pubkey comes
         // straight from it with no host-side key derivation.
         let expanded = recv.recv().unwrap();
@@ -334,14 +373,17 @@ fn main() {
         // all write to that prefix's single `out` slot, so the key read back
         // may not be the one that matched. Verify before emitting it; a
         // non-match just means we lost the race, and the search continues.
-        if !prefixes.iter().any(|p| onion.starts_with(p.as_str())) {
-            continue;
-        }
+        let matched = match prefixes.iter().find(|p| onion.starts_with(p.as_str())) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
 
         println!("{}", onion);
-        let mut f = std::fs::File::create(dst.join(onion)).unwrap();
-        f.write_all(FILE_PREFIX).unwrap();
-        f.write_all(&esk.to_bytes()).unwrap();
-        f.flush().unwrap();
+        sink.write(&output::Key {
+            onion: onion.clone(),
+            expanded: esk.to_bytes(),
+            matched,
+        })
+        .unwrap();
     }
 }

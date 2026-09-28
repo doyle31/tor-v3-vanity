@@ -13,7 +13,10 @@ include = ["src/**/*", "Cargo.toml", "Cargo.lock", "core/src/**/*", "core/Cargo.
 
 [[bin]]
 name = "t3v"
-test = false
+# `test = true` so the unit tests in src/output.rs actually run; they were
+# silently skipped while this was false, which made `cargo test` a no-op that
+# reported success.
+test = true
 bench = false
 path = "src/main.rs"
 

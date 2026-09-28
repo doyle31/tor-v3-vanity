@@ -32,6 +32,9 @@ pub struct BytePrefixOwned {
     pub byte_prefix: rustacuda::memory::DeviceBuffer<u8>,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
+    /// The same prefix bytes packed little-endian, which is what the kernel
+    /// actually compares against.
+    pub prefix_word: u64,
     /// Capture ring: `SLOTS` expanded keys of `SLOT_BYTES` bytes each.
     pub out: rustacuda::memory::DeviceBuffer<u8>,
     /// How many keys the kernel published into the ring this launch.
@@ -40,6 +43,19 @@ pub struct BytePrefixOwned {
 
 impl BytePrefixOwned {
     pub fn from_str(s: &str) -> Self {
+        // The kernel tests the low eight bytes of the encoding in one 64-bit
+        // word (`BytePrefix::matches_low8`), so a prefix that reaches past byte
+        // 7 cannot be tested at all. `MAX_PREFIX_CHARS` is 12, i.e. 60 bits --
+        // a 12-character prefix is already a 2^60-candidate search, so nothing
+        // longer is worth finding. Rejecting it here is better than letting the
+        // kernel silently never match.
+        assert!(
+            s.len() <= core::BytePrefix::MAX_PREFIX_CHARS,
+            "a prefix may be at most {} characters, got {} ({:?})",
+            core::BytePrefix::MAX_PREFIX_CHARS,
+            s.len(),
+            s
+        );
         let byte_prefix = base32::decode(
             base32::Alphabet::RFC4648 { padding: false },
             &format!("{}aa", s),
@@ -51,6 +67,8 @@ impl BytePrefixOwned {
         if last_byte_mask > 0 {
             last_byte_idx += 1;
         }
+        debug_assert!(last_byte_idx < 8);
+        let prefix_word = core::BytePrefix::pack_prefix_word(&byte_prefix);
         let gpu_byte_prefix = rustacuda::memory::DeviceBuffer::from_slice(&byte_prefix).unwrap();
         let out = vec![0u8; core::SLOTS * core::SLOT_BYTES];
         let gpu_out = rustacuda::memory::DeviceBuffer::from_slice(&out).unwrap();
@@ -59,6 +77,7 @@ impl BytePrefixOwned {
             byte_prefix: gpu_byte_prefix,
             last_byte_idx,
             last_byte_mask,
+            prefix_word,
             out: gpu_out,
             count: gpu_count,
         }
@@ -70,6 +89,7 @@ impl BytePrefixOwned {
             byte_prefix_len: self.byte_prefix.len(),
             last_byte_idx: self.last_byte_idx,
             last_byte_mask: self.last_byte_mask,
+            prefix_word: self.prefix_word,
             out: self.out.as_device_ptr(),
             count: self.count.as_device_ptr(),
         }
@@ -167,6 +187,7 @@ pub fn start(
                     byte_prefix_len: 0,
                     last_byte_idx: 0,
                     last_byte_mask: 0,
+                    prefix_word: 0,
                     out: gpu_seed.as_device_ptr(),
                     count: gpu_count_zero.as_device_ptr(),
                 });

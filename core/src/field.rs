@@ -451,6 +451,40 @@ pub fn fe_to_bytes(a: &Fe) -> [u8; 32] {
     out
 }
 
+/// The first eight bytes of `fe_to_bytes(a)`, packed little-endian into a `u64`.
+///
+/// # Why the prefix of the encoding is enough to test a prefix
+///
+/// `fe_to_bytes` packs five 51-bit limbs into one contiguous little-endian bit
+/// stream, so byte `i` of the result is bits `8i..8i+8` of
+/// `sum(t[k] << 51k)`. Limbs 1..=4 contribute only at bit 51 and above, so the
+/// low eight bytes are decided by limbs 0 and 1 alone:
+///
+/// ```text
+///     low64 = t[0] | (t[1] << 51)
+/// ```
+///
+/// Both limbs must be true radix digits for that to be the encoding rather than
+/// merely a congruent value: a carry or a subtraction of `p` propagates upward
+/// only, but it changes the low bits anyway (which is the whole reason
+/// `fe_reduce` cannot be skipped). `fe_reduce` returns the canonical
+/// representative in `[0, p)`, every limb of which is a true digit below
+/// `2^51`, so the identity above is exact.
+///
+/// The point of the function is that a Tor onion address is
+/// `base32(pubkey || checksum || version)`, whose first characters come from the
+/// *low* bits of `y`. The sign of `x` lives in bit 255 -- byte 31, twenty-three
+/// bytes above anything a prefix can reach -- so testing a prefix never needs
+/// `x` at all, and never needs the 32-byte encoding or the other 24 bytes of it.
+#[inline(always)]
+pub fn fe_to_bytes_low8(a: &Fe) -> u64 {
+    // One reduction, not `fe_reduce(&carry(*a))`: `fe_reduce` begins with
+    // `carry`, and `carry` is the identity on limbs that are already digits,
+    // which is what every caller here hands it.
+    let t = fe_reduce(a);
+    t[0] | (t[1] << 51)
+}
+
 /// Decode 32 little-endian bytes into five 51-bit limbs.
 ///
 /// Bits 255 and above are ignored, as ed25519 requires. This walks the same
@@ -676,9 +710,9 @@ mod tests {
             [18, 0, 0, 0, 0],
             [19, 0, 0, 0, 0],
             [20, 0, 0, 0, 0],
-            [MASK - 18, MASK, MASK, MASK, MASK], // p - 1
-            [MASK - 19, MASK, MASK, MASK, MASK], // p
-            [MASK - 20, MASK, MASK, MASK, MASK], // p + 1
+            [MASK - 19, MASK, MASK, MASK, MASK], // p - 1
+            [MASK - 18, MASK, MASK, MASK, MASK], // p
+            [MASK - 17, MASK, MASK, MASK, MASK], // p + 1
         ];
         let mut s: u64 = 0x243F_6A88_85A3_08D3;
         let mut bit = || {
@@ -748,6 +782,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The low word must be *exactly* the first eight bytes of the encoding.
+    ///
+    /// This is the identity the y-only prefix path rests on, and it has a real
+    /// trap in it: limbs 1..=4 contribute only at bit 51 and above, but a
+    /// carry out of limb 0 -- or the subtraction of `p` -- changes the low bits
+    /// while leaving the limbs above it alone. So `fe_to_bytes_low8` has to
+    /// reduce first, and "reduce" has to mean the canonical representative, not
+    /// merely a congruent one. `adversarial` is the operand set that separates
+    /// the two, for the reason `mul_distributes_over_add` documents.
+    #[test]
+    fn low8_is_the_first_eight_bytes() {
+        for a in adversarial().iter() {
+            let b = fe_to_bytes(a);
+            let w = fe_to_bytes_low8(a);
+            let got = [
+                w as u8,
+                (w >> 8) as u8,
+                (w >> 16) as u8,
+                (w >> 24) as u8,
+                (w >> 32) as u8,
+                (w >> 40) as u8,
+                (w >> 48) as u8,
+                (w >> 56) as u8,
+            ];
+            assert_eq!(&got[..], &b[..8], "low8 of {:?}", a);
+        }
+    }
+
+    /// The same identity, on the values the kernel actually produces: a field
+    /// multiply's output, which is what `y = Y * Z^-1` is.
+    #[test]
+    fn low8_of_a_product_is_the_encoding_prefix() {
+        let cases = adversarial();
+        for a in cases.iter() {
+            for b in cases.iter() {
+                let p = fe_mul(a, b);
+                let w = fe_to_bytes_low8(&p);
+                let bytes = fe_to_bytes(&p);
+                for i in 0..8 {
+                    assert_eq!((w >> (8 * i)) as u8, bytes[i], "byte {}", i);
+                }
+            }
+        }
+    }
+
+    /// `fe_to_bytes_low8` must not be sensitive to whether the input is already
+    /// reduced, or the two entry points into it (`fe_mul` and a raw limb vector)
+    /// would disagree on the same field element.
+    #[test]
+    fn low8_does_not_depend_on_the_input_representation() {
+        // p - 1, p, p + 1 and 2^255 + 13 are all the same field element or
+        // differ by p; the encoding must not notice.
+        for extra in 0..8u64 {
+            let a: Fe = [
+                MASK + extra,
+                MASK,
+                MASK,
+                MASK,
+                MASK,
+            ];
+            assert_eq!(
+                fe_to_bytes_low8(&a),
+                fe_to_bytes_low8(&fe_reduce(&a)),
+                "extra {}",
+                extra
+            );
+        }
+        // 0 and p are the same element and both encode as zero. (The p digits
+        // are [2^51-19, MASK, ...] = [MASK-18, MASK, ...]; the `adversarial`
+        // table above lists the same vectors with slightly off comments.)
+        assert_eq!(fe_to_bytes_low8(&FE_ZERO), 0);
+        assert_eq!(fe_to_bytes_low8(&[MASK - 18, MASK, MASK, MASK, MASK]), 0);
     }
 
     #[test]

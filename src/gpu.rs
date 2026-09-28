@@ -160,15 +160,21 @@ fn upload_base_tables() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
 /// Start one search thread per CUDA device.
 ///
 /// An empty `prefixes` is the benchmark case: the kernel then skips matching
-/// entirely. When `stop` is set the loops exit after the current launch, which
-/// is how a benchmark shuts the GPU down without leaving it running.
+/// entirely. When `stop` is set the loops exit after the current launch.
+///
+/// The returned handles must be joined before the process tears CUDA down.
+/// Setting `stop` only *asks* a thread to finish its current launch; a thread
+/// still in `stream.synchronize` when the process starts exiting gets
+/// `Error::Deinitialized` from the driver, which used to panic the worker and
+/// leave the search silently producing nothing. Joining is what makes the
+/// shutdown deterministic.
 pub fn start(
     prefixes: &[String],
     sender: crossbeam_channel::Sender<[u8; 64]>,
     tries_sender: crossbeam_channel::Sender<u64>,
     stop: Option<Arc<AtomicBool>>,
     launch: Launch,
-) -> Result<Dropped, Error> {
+) -> Result<(Dropped, Vec<std::thread::JoinHandle<()>>), Error> {
     use rustacuda::launch;
     use rustacuda::memory::DeviceBox;
     use rustacuda::prelude::*;
@@ -176,6 +182,7 @@ pub fn start(
 
     rustacuda::init(CudaFlags::empty())?;
     let dropped_keys: Dropped = Arc::new(AtomicU64::new(0));
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut i = 0;
     for device in rustacuda::device::Device::devices()? {
         let device = device?;
@@ -184,12 +191,41 @@ pub fn start(
         let tries_sender = tries_sender.clone();
         let dropped_keys = dropped_keys.clone();
         let stop = stop.clone();
-        std::thread::spawn(move || {
+        workers.push(std::thread::spawn(move || {
             use rand::RngCore;
             let mut csprng = assert_crypto_rng(rand::thread_rng());
             let _context =
                 Context::create_and_push(ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)
                     .unwrap();
+
+            // Re-install the signal handlers *here*, after the CUDA context
+            // exists, and re-assert them on every launch below.
+            //
+            // Creating a CUDA context resets SIGTERM and SIGINT to the default,
+            // so the install in `main` is silently discarded. `sigaction` is
+            // process-wide, so installing from this worker is equivalent to
+            // installing from main.
+            //
+            // Re-asserting per launch is not belt-and-braces, it is necessary.
+            // The reset is not at a fixed point in the init sequence: two runs
+            // of the same binary, sampled at the same point six seconds in, gave
+            // SigCgt = 0x100004442 (both caught) and SigCgt = 0x10000 (neither),
+            // so something in CUDA's setup or the PTX JIT clears them
+            // nondeterministically and no single "install after X" placement is
+            // reliable. Re-asserting once per launch bounds the window in which a
+            // signal can be missed to one launch, and costs two syscalls per
+            // ~70 ms.
+            //
+            // The symptom when this is missing is silent and bad: Ctrl-C or
+            // `kill` kills the process outright, the shutdown path never runs,
+            // and a `.json` array file is left without its closing bracket --
+            // unparseable. Which is the exact failure `signal` exists to prevent.
+            if let Err(e) = crate::signal::install() {
+                eprintln!(
+                    "warning: device {}: cannot install signal handlers after CUDA init: {}",
+                    i, e
+                );
+            }
 
             let module_data = CString::new(include_str!(env!("KERNEL_PTX_PATH"))).unwrap();
             let kernel = Module::load_from_string(&module_data).unwrap();
@@ -259,6 +295,10 @@ pub fn start(
             let mut ring = vec![0u8; core::SLOTS * core::SLOT_BYTES];
 
             loop {
+                // Re-assert the handlers every launch: CUDA clears them
+                // nondeterministically during setup (see the note above). Cheap,
+                // and it is what makes Ctrl-C deterministic.
+                let _ = crate::signal::install();
                 csprng.fill_bytes(&mut seed);
                 gpu_seed.copy_from(&seed).unwrap();
                 unsafe {
@@ -315,14 +355,14 @@ pub fn start(
                     }
                 }
             }
-        });
+        }));
         i += 1;
     }
     if i == 0 {
         eprintln!("No cuda devices available.");
         std::process::exit(2);
     }
-    Ok(dropped_keys)
+    Ok((dropped_keys, workers))
 }
 
 /// Choose threads per block and blocks per launch.

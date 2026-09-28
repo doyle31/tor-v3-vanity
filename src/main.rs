@@ -88,7 +88,7 @@ fn to_chrono(secs: f64) -> chrono::Duration {
 /// unrelated `RecvError`, and the actual cause was buried. Worse, the user had
 /// no way to tell which of several `T3V_*` variables was at fault.
 fn validate_tunables() {
-    let mut bad = |name: &str, value: usize, ok: bool, want: &str| {
+    let bad = |name: &str, value: usize, ok: bool, want: &str| {
         if !ok {
             eprintln!(
                 "error: {} is {}, but {}. Rebuild without that variable, or set it to {}.",
@@ -125,6 +125,10 @@ fn main() {
     // Install before anything can block, so a signal during startup is still
     // noticed. Failure is not fatal: a search without it still works, it just
     // will not close its output file cleanly.
+    //
+    // This is not sufficient on its own. Creating the CUDA context resets
+    // SIGTERM and SIGINT to the default, so `gpu` re-installs the handlers from
+    // the worker thread once the context exists. See the comment there.
     if let Err(e) = signal::install() {
         eprintln!("warning: cannot install signal handlers: {}", e);
     }
@@ -194,7 +198,7 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
     // A shutdown request has to reach the GPU threads, so they get the stop flag
     // and this loop watches the signal flag.
     let stop = signal::stopper();
-    let dropped_keys =
+    let (dropped_keys, workers) =
         gpu::start(prefixes, send, send_tries, Some(stop.clone()), launch).unwrap();
 
     let log_interval = opts.log_interval;
@@ -271,9 +275,16 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         .unwrap();
     }
 
-    // Shut down cleanly. Stopping the GPU threads first stops new keys arriving
-    // while the sink is being closed.
+    // Shut down cleanly. Ask the GPU threads to stop, then *wait* for them
+    // before touching the sink: a worker still inside `stream.synchronize`
+    // when the process starts tearing CUDA down gets `Deinitialized` back and
+    // dies, which used to leave the search silently producing nothing.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for worker in workers {
+        if worker.join().is_err() {
+            eprintln!("warning: a GPU worker thread panicked; some keys may be missing");
+        }
+    }
     // `finish` is what closes a `.json` array with its `]`; without it such a
     // file is unparseable, and every other format is left with a torn last
     // record. It is also safe to call for CSV and JSON Lines, where it is just

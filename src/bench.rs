@@ -53,17 +53,22 @@ pub fn once(
     // Each rep must fully stop the previous rep's launch loop, or two kernels
     // share the GPU and every run after the first is measured under contention.
     let stop = Arc::new(AtomicBool::new(false));
-    gpu::start(prefixes, send, send_tries, Some(stop.clone()), launch).unwrap();
+    let (_dropped, workers) =
+        gpu::start(prefixes, send, send_tries, Some(stop.clone()), launch).unwrap();
 
     let start = Instant::now();
     std::thread::sleep(Duration::from_secs(secs));
     let elapsed = start.elapsed().as_secs_f64();
     let keys = total.load(Ordering::Relaxed);
 
+    // Wait for the launch loop to finish its in-flight launch and exit, so the
+    // next rep starts on an idle GPU. Joining is exact; this used to be a
+    // 500 ms sleep, which was a guess at how long a launch takes and left the
+    // next rep measuring a GPU that was still busy when the sleep ran out.
     stop.store(true, Ordering::Relaxed);
-    // Let the launch loop finish its in-flight launch and exit before
-    // returning, so the next rep starts on an idle GPU.
-    std::thread::sleep(Duration::from_millis(500));
+    for worker in workers {
+        let _ = worker.join();
+    }
     (keys, elapsed)
 }
 

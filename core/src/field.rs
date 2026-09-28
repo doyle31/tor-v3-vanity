@@ -111,12 +111,29 @@ pub fn fe_add(a: &Fe, b: &Fe) -> Fe {
     fe_reduce(&carry(r))
 }
 
-/// Bring a value with limbs < 2^51 into the canonical representative in [0, p).
+/// Bring any limb vector into the canonical representative in [0, p).
 ///
-/// carry() guarantees each limb is under 2^51, but the value can still reach
-/// ~2^256, so it may need p subtracted. p = 2^255 - 19 has radix-2^51 digits
-/// [2^51-19, 2^51-1, 2^51-1, 2^51-1, 2^51-1] plus an implicit 2^255, which
-/// is exactly the 19 already folded into limb 0 by carry().
+/// The input limbs are *not* required to be radix digits; `carry` at the top of
+/// this function normalises whatever it is given, and the borrow chain then runs
+/// over a true digit vector.
+///
+/// # The subtraction of p is load-bearing -- do not remove it
+///
+/// It is tempting to read this as dead code, because `carry` leaves every limb
+/// below 2^51 and it is easy to conclude the value is therefore below p. That
+/// conclusion is wrong. The value is the *weighted* sum
+/// `sum r[i] * 2^(51*i)`, and with all five limbs maximal that is 2^255 - 1,
+/// not 5 * 2^51. So the post-`carry` value can sit in [p, 2^255) -- 19 values
+/// wide -- and the subtraction fires for those.
+///
+/// It is not a corner case either. `fe_sub(a, a)` is the exact-zero difference,
+/// which lands on p rather than 0, and only this function maps p back to 0.
+/// `sub_wraps_past_p` asserts exactly that, so deleting the borrow chain fails
+/// the suite rather than passing quietly.
+///
+/// p = 2^255 - 19 has radix-2^51 digits [2^51-19, 2^51-1, 2^51-1, 2^51-1,
+/// 2^51-1] plus an implicit 2^255, which is exactly the 19 that `carry` has
+/// already folded into limb 0.
 fn fe_reduce(a: &Fe) -> Fe {
     const P: Fe = [
         (1u64 << 51) - 19,
@@ -129,24 +146,26 @@ fn fe_reduce(a: &Fe) -> Fe {
     // Subtract p as a borrow chain rather than comparing limb-by-limb.
     //
     // The borrow out of the top limb is 1 exactly when a < p, so the mask
-    // selects a - p when a >= p and leaves a alone otherwise. Two things make
-    // this the only correct shape:
-    //
-    //  * `a` must be a true digit vector first. It is not one: fe_mul's carry
-    //    chain leaves limb 2 at 2^51, and a borrow chain over non-normalised
-    //    digits computes the wrong difference (it is how fe_invert(2) came out
-    //    as [0x1000, 0x1fff, 0x1fff, 0, 0] instead of 2). carry() guarantees
-    //    that now.
-    //  * A limb-by-limb `>=` scan cannot tell "already greater" from "still
-    //    equal", so it resurrected `a >= p` whenever a lower limb happened to
-    //    equal p's after a higher limb had already decided `a < p`. A carried
-    //    limb lands on 2^51-1 often enough for that to be reachable, and it
-    //    is how fe_invert(2), fe_invert(4), fe_invert(8), fe_invert(16),
-    //    fe_invert(32) and fe_invert(38) all came out wrong. See
-    //    `invert_of_small_values_is_exact`.
+    // selects a - p when a >= p and leaves a alone otherwise.
     //
     // The chain is also a little cheaper than the scan it replaces: two
     // overflowing_sub per limb instead of a compare plus an equality test.
+    //
+    // History, since the shape is only explicable by what it replaced. A
+    // limb-by-limb `>=` scan cannot tell "already greater" from "still equal",
+    // so it resurrected `a >= p` whenever a lower limb happened to equal p's
+    // after a higher limb had already decided `a < p`. A carried limb lands on
+    // 2^51-1 often enough for that to be reachable, and it is how
+    // fe_invert(2), fe_invert(4), fe_invert(8), fe_invert(16), fe_invert(32)
+    // and fe_invert(38) all came out wrong. See `invert_of_small_values_is_exact`.
+    //
+    // A second historical bug, `fe_invert(2)` coming out as
+    // [0x1000, 0x1fff, 0x1fff, 0, 0], was a *single-pass* carry leaving limbs
+    // at 2^51 -- a borrow chain over non-normalised digits computes the wrong
+    // difference. The `carry` loop fixed that, not the borrow chain. The claim
+    // that the carry chain still leaves limb 2 at 2^51 is no longer true of
+    // `fe_mul`, whose output now reaches this function through `carry_product`
+    // and is normalised on the way in.
     let n = carry(*a);
     let mut diff = [0u64; 5];
     let mut borrow = 0u64;

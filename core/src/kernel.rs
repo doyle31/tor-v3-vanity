@@ -64,7 +64,7 @@ use super::field::{fe_mul, FE_ONE};
 #[cfg(target_arch = "nvptx64")]
 use super::group::{batch_invert_into, COMB_BITS, COMB_LEN, COMB_W};
 #[cfg(target_arch = "nvptx64")]
-use super::{BATCH, BLOCK, CHUNK};
+use super::{BATCH, CHUNK};
 
 /// A match found during a batch.
 #[derive(Copy, Clone)]

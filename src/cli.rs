@@ -54,6 +54,8 @@ pub struct Options {
     pub verbose: bool,
     pub threads: Option<u32>,
     pub blocks_per_sm: Option<u32>,
+    /// How hard to push each key to disk.
+    pub durability: output::Durability,
 }
 
 /// Parse the process arguments.
@@ -122,6 +124,22 @@ pub fn parse() -> Options {
         eprintln!("warning: --format has no effect without --out; using per-key files");
     }
 
+    // Durability follows the longest prefix unless overridden. The reasoning is
+    // in `output::Durability`: an fsync per key is ruinous at thousands of
+    // matches per second and free at a handful, and the long searches are both
+    // the ones worth protecting and the ones where it is cheap.
+    let longest = m
+        .values_of("PREFIX")
+        .map(|v| v.map(|s| s.len()).max().unwrap_or(0))
+        .unwrap_or(0);
+    let durability = if m.is_present("no-fsync") {
+        output::Durability::Buffered
+    } else if m.is_present("fsync") {
+        output::Durability::Durable
+    } else {
+        output::Durability::for_prefix_len(longest)
+    };
+
     Options {
         mode,
         prefixes: m
@@ -142,6 +160,7 @@ pub fn parse() -> Options {
         blocks_per_sm: m
             .value_of("blocks-per-sm")
             .map(|p| p.parse().expect("--blocks-per-sm takes a count")),
+        durability: durability,
     }
 }
 
@@ -251,5 +270,21 @@ fn app() -> clap::App<'static, 'static> {
                 .short("p")
                 .takes_value(true)
                 .help("Blocks per SM to launch. Default: fill the device"),
+        )
+        // --- durability -------------------------------------------------------
+        .arg(
+            clap::Arg::with_name("fsync")
+                .long("fsync")
+                .help("fsync every key, so it survives a crash or power loss. \
+                       The default already follows the prefix length: on for 5 \
+                       characters and longer, where a key arrives every few \
+                       seconds and durability is free; off below that, where \
+                       keys arrive thousands per second and it is not"),
+        )
+        .arg(
+            clap::Arg::with_name("no-fsync")
+                .long("no-fsync")
+                .help("Buffer output even for long prefixes, trading durability \
+                       for throughput"),
         )
 }

@@ -127,8 +127,16 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             let chosen = opts
                 .format
                 .unwrap_or_else(|| output::Format::from_path(path));
-            eprintln!("Writing matches to {} ({})", path.display(), chosen.name());
-            output::Sink::open_format(path, chosen).unwrap()
+            eprintln!(
+                "Writing matches to {} ({}, {})",
+                path.display(),
+                chosen.name(),
+                match opts.durability {
+                    output::Durability::Durable => "fsync per key",
+                    output::Durability::Buffered => "buffered",
+                }
+            );
+            output::Sink::open_format(path, chosen, opts.durability).unwrap()
         }
         None => {
             let dst = opts

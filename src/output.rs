@@ -143,7 +143,56 @@ pub enum Sink {
     JsonArray(BufWriter<File>, u64, Flusher),
 }
 
-/// Time-based flush guard.
+/// Whether each record is pushed all the way to disk before the next is
+/// written.
+///
+/// This trade runs opposite to intuition, and the reason is that durability gets
+/// *cheaper* exactly where it starts to matter. A search finds keys at roughly
+/// `keys_per_second / 2^(5 * prefix_len)`, so at ~150M keys/s:
+///
+/// | prefix | matches/s | one fsync | right answer |
+/// |---|---|---|---|
+/// | 2 chars | ~37,000 | ruinous | buffered |
+/// | 3 chars | ~4,600  | ruinous | buffered |
+/// | 4 chars | ~143    | still far too many | buffered |
+/// | 5 chars | ~4.5    | negligible | **durable** |
+/// | 6 chars | ~0.14   | free | **durable** |
+/// | 7 chars | ~0.004  | free | **durable** |
+///
+/// The long searches are the ones worth protecting: a 7-character prefix takes
+/// minutes of searching, and buffering alone means a crash near the end can
+/// throw the result away. That is also precisely where an fsync is free,
+/// because matches are that rare. So the default follows the prefix length, and
+/// `--fsync` / `--no-fsync` override it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Durability {
+    /// Buffer, and push to the OS on a timer. Fastest; a crash can lose the
+    /// records still in the buffer.
+    Buffered,
+    /// `fsync` every record, so it survives a crash or power loss.
+    Durable,
+}
+
+impl Durability {
+    /// The policy that suits a prefix of `len` characters.
+    ///
+    /// Five is the crossover: ~4.5 matches per second, where an fsync is a
+    /// rounding error, against ~143 per second at four characters, where it is
+    /// not.
+    pub fn for_prefix_len(len: usize) -> Self {
+        if len >= 5 {
+            Durability::Durable
+        } else {
+            Durability::Buffered
+        }
+    }
+
+    pub fn is_durable(self) -> bool {
+        self == Durability::Durable
+    }
+}
+
+/// Time-based flush guard, plus the durability policy.
 ///
 /// Buffering exists because a fast search can emit keys faster than a syscall
 /// can serve them, but a plain `BufWriter` only flushes when it fills. Measured
@@ -151,21 +200,41 @@ pub enum Sink {
 /// file, because the whole run's keys fit in the 64 KiB buffer. Every key
 /// found in that run was lost on exit.
 ///
-/// So each write also flushes once `FLUSH_AFTER` has elapsed, bounding the loss
-/// to one interval of keys rather than to a whole buffer. Matches are rare
-/// enough (about one per 2^(5*prefix_len)) that this costs nothing measurable.
+/// So in buffered mode each write also flushes once `FLUSH_AFTER` has elapsed,
+/// bounding the loss to one interval of keys rather than a whole buffer.
 pub struct Flusher {
     last: std::time::Instant,
+    durability: Durability,
 }
 
 impl Flusher {
-    fn new() -> Self {
-        Flusher { last: std::time::Instant::now() }
+    fn new(durability: Durability) -> Self {
+        Flusher {
+            last: std::time::Instant::now(),
+            durability,
+        }
     }
 }
 
-/// Flush at most this often, regardless of how full the buffer is.
+/// In buffered mode, flush at most this often regardless of how full the
+/// buffer is. Ignored entirely in durable mode, which always flushes.
 const FLUSH_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Push out the current record according to the policy.
+///
+/// Buffered: flush only if the timer has elapsed. Durable: flush and `fsync`
+/// every time, so the record is on the platter before the next key is even
+/// derived.
+fn emit(w: &mut BufWriter<File>, g: &mut Flusher) -> io::Result<()> {
+    if g.durability.is_durable() {
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    } else if g.last.elapsed() >= FLUSH_AFTER {
+        w.flush()?;
+        g.last = std::time::Instant::now();
+    }
+    Ok(())
+}
 
 impl Sink {
     /// Open a sink for `path` in an explicit `format`.
@@ -173,10 +242,10 @@ impl Sink {
     /// The format is a parameter rather than something derived from `path`, so
     /// any filename works with any format. See [`Sink::open`] for the
     /// extension-inferring convenience wrapper.
-    pub fn open_format(path: &Path, format: Format) -> io::Result<Self> {
+    pub fn open_format(path: &Path, format: Format, durability: Durability) -> io::Result<Self> {
         let file = File::create(path)?;
         let w = BufWriter::with_capacity(1 << 16, file);
-        let g = Flusher::new();
+        let g = Flusher::new(durability);
         match format {
             Format::Csv => {
                 let mut w = w;
@@ -199,9 +268,9 @@ impl Sink {
     ///
     /// Prefer passing the resolved `--format` value here so that a name like
     /// `keys.dat` is not silently reinterpreted.
-    pub fn open(path: &Path, explicit: Option<Format>) -> io::Result<Self> {
+    pub fn open(path: &Path, explicit: Option<Format>, durability: Durability) -> io::Result<Self> {
         let format = explicit.unwrap_or_else(|| Format::from_path(path));
-        Self::open_format(path, format)
+        Self::open_format(path, format, durability)
     }
 
     /// A sink that writes one file per key into `dir`.
@@ -226,7 +295,7 @@ impl Sink {
             }
             Sink::Csv(w, g) => {
                 writeln!(w, "{},{},{}", key.onion, hx, key.matched)?;
-                maybe_flush(w, g)?;
+                emit(w, g)?;
             }
             // JSON Lines: no separators and no wrapper. Each record is
             // self-contained and terminated by its own newline, which is what
@@ -240,7 +309,7 @@ impl Sink {
                     json_escape(&key.matched)
                 )?;
                 *n += 1;
-                maybe_flush(w, g)?;
+                emit(w, g)?;
             }
             Sink::JsonArray(w, n, g) => {
                 if *n > 0 {
@@ -254,7 +323,7 @@ impl Sink {
                     json_escape(&key.matched)
                 )?;
                 *n += 1;
-                maybe_flush(w, g)?;
+                emit(w, g)?;
             }
         }
         Ok(())
@@ -291,15 +360,6 @@ impl Sink {
     }
 }
 
-/// Flush `w` if `FLUSH_AFTER` has passed since the previous flush, then reset
-/// the timer regardless of whether a flush happened.
-fn maybe_flush(w: &mut BufWriter<File>, g: &mut Flusher) -> io::Result<()> {
-    if g.last.elapsed() >= FLUSH_AFTER {
-        w.flush()?;
-        g.last = std::time::Instant::now();
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -384,7 +444,7 @@ mod tests {
         // The whole point of --format: a `.json` name holding CSV, and an
         // extensionless name holding JSON, must both do what was asked.
         let p = tmp("override-json");
-        let mut s = Sink::open(&p, Some(Format::Csv)).unwrap();
+        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Buffered).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -392,7 +452,7 @@ mod tests {
         assert!(!body.contains('['), "must not be a JSON array");
 
         let p = tmp("override-noext");
-        let mut s = Sink::open(&p, Some(Format::JsonArray)).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -403,7 +463,7 @@ mod tests {
     #[test]
     fn extensionless_output_falls_back_to_csv_and_still_writes() {
         let p = tmp("noext");
-        let mut s = Sink::open(&p, None).unwrap();
+        let mut s = Sink::open(&p, None, Durability::Buffered).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -420,7 +480,7 @@ mod tests {
         for f in formats {
             for n in names {
                 let p = tmp(&format!("matrix-{}-{}", f.name(), n.replace('.', "_")));
-                let mut s = Sink::open(&p, Some(f)).unwrap();
+                let mut s = Sink::open(&p, Some(f), Durability::Buffered).unwrap();
                 s.write(&key(7)).unwrap();
                 s.finish().unwrap();
                 let body = std::fs::read_to_string(&p).unwrap();
@@ -453,7 +513,7 @@ mod tests {
     #[test]
     fn csv_has_header_and_one_row_per_key() {
         let p = tmp("csv");
-        let mut s = Sink::open(&p, None).unwrap();
+        let mut s = Sink::open(&p, None, Durability::Buffered).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -476,7 +536,7 @@ mod tests {
     #[test]
     fn jsonl_is_one_object_per_line() {
         let p = tmp("jsonl");
-        let mut s = Sink::open(&p, Some(Format::JsonLines)).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonLines), Durability::Buffered).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -496,13 +556,13 @@ mod tests {
     #[test]
     fn json_array_is_valid_when_empty_and_populated() {
         let p = tmp("json-empty");
-        let mut s = Sink::open(&p, Some(Format::JsonArray)).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
         s.finish().unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[\n]\n");
         std::fs::remove_file(&p).unwrap();
 
         let p = tmp("json-full");
-        let mut s = Sink::open(&p, Some(Format::JsonArray)).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -595,7 +655,7 @@ mod tests {
 
     /// Write sample records to `path` in `format` and return the file text.
     fn render(format: Format, path: &Path, keys: &[Key]) -> String {
-        let mut s = Sink::open(path, Some(format)).unwrap();
+        let mut s = Sink::open(path, Some(format), Durability::Buffered).unwrap();
         for k in keys {
             s.write(k).unwrap();
         }
@@ -831,7 +891,7 @@ mod tests {
             (Format::JsonLines, "dur-jsonl"),
         ] {
             let p = tmp(name);
-            let mut s = Sink::open(&p, Some(fmt)).unwrap();
+            let mut s = Sink::open(&p, Some(fmt), Durability::Buffered).unwrap();
             // The CSV header is written and flushed at open, so the file is
             // non-empty from the start; JSONL starts empty. Only the *keys*
             // are what this test is about.
@@ -853,6 +913,68 @@ mod tests {
             s.finish().unwrap();
             std::fs::remove_file(&p).unwrap();
         }
+    }
+
+    #[test]
+    fn durability_follows_the_prefix_length() {
+        // The crossover is 5: ~4.5 matches/s at 149M keys/s, where an fsync is
+        // a rounding error, against ~143/s at 4 chars, where it is not.
+        for len in 0..=4 {
+            assert_eq!(
+                Durability::for_prefix_len(len),
+                Durability::Buffered,
+                "{} chars should stay buffered",
+                len
+            );
+        }
+        for len in 5..=12 {
+            assert_eq!(
+                Durability::for_prefix_len(len),
+                Durability::Durable,
+                "{} chars should be durable",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn durable_sink_writes_every_record_immediately() {
+        // The point of durable mode: a record must be readable before the next
+        // one is written, so a crash cannot lose it. Check that by reading the
+        // file while the sink is still open and unflushed.
+        let p = tmp("durable");
+        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Durable).unwrap();
+        s.write(&key(1)).unwrap();
+        let after_first = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after_first.contains(&hex(&key(1).expanded)),
+            "durable mode must have pushed key 1 already"
+        );
+        s.write(&key(2)).unwrap();
+        let after_second = std::fs::read_to_string(&p).unwrap();
+        assert!(after_second.contains(&hex(&key(1).expanded)));
+        assert!(after_second.contains(&hex(&key(2).expanded)));
+        s.finish().unwrap();
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn durable_json_array_is_recoverable_without_the_closing_bracket() {
+        // Durable mode is what makes an interrupted .json array worth anything:
+        // each record is on disk as it is found. This checks the records are
+        // individually parseable even though the array is not closed.
+        let p = tmp("durable-json");
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Durable).unwrap();
+        s.write(&key(1)).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"expanded_key\""));
+        // Deliberately do not call finish(): simulate a crash mid-array.
+        let body = raw.trim_start_matches('[').trim();
+        let first = body.lines().next().unwrap().trim_end_matches(',');
+        let v = parse_json(first);
+        assert_eq!(v.kind, JKind::Object);
+        assert_eq!(v.get("onion"), Some(key(1).onion.as_str()));
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

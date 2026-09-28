@@ -9,7 +9,7 @@ repository = "https://github.com/dr-bonez/tor-v3-vanity"
 documentation = "http://docs.rs/tor-v3-vanity"
 readme = "README.md"
 keywords = ["tor", "v3", "vanity", "gpu", "cuda"]
-include = ["src/**/*", "Cargo.toml", "core/**/*", "build.rs", "README.md", "LICENSE", "foo/bar"]
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "core/src/**/*", "core/Cargo.toml", "core/Cargo.lock", "build.rs", "README.md", "LICENSE"]
 
 [[bin]]
 name = "t3v"
@@ -32,5 +32,3 @@ rustacuda = "0.1.2"
 sha3 = "0.9.1"
 tor-v3-vanity-core = { version = "0.1.0", path = "./core" }
 
-[build-dependencies]
-ptx-builder = "0.5"

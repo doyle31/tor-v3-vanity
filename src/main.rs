@@ -54,6 +54,7 @@ pub struct BytePrefixOwned {
     pub byte_prefix: rustacuda::memory::DeviceBuffer<u8>,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
+    /// 64-byte expanded secret key (clamped scalar || nonce prefix).
     pub out: rustacuda::memory::DeviceBuffer<u8>,
     pub success: rustacuda::memory::DeviceBox<bool>,
 }
@@ -71,7 +72,8 @@ impl BytePrefixOwned {
             last_byte_idx += 1;
         }
         let gpu_byte_prefix = rustacuda::memory::DeviceBuffer::from_slice(&byte_prefix).unwrap();
-        let out = [0; 32];
+        // The kernel now returns a full expanded key, not just a 32-byte seed.
+        let out = [0u8; 64];
         let gpu_out = rustacuda::memory::DeviceBuffer::from_slice(&out).unwrap();
         let success = false;
         let gpu_success = rustacuda::memory::DeviceBox::new(&success).unwrap();
@@ -99,9 +101,34 @@ fn assert_crypto_rng<Rng: rand::CryptoRng>(rng: Rng) -> Rng {
     rng
 }
 
+/// Build the `[2^i]B` ladder on the host and upload it once per device.
+///
+/// The kernel needs this table to avoid recomputing the doubling ladder for
+/// every candidate key. It is 255 * 4 * 5 u64s = 40800 bytes.
+fn upload_power_table() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
+    use core::group::{build_power_table, Ge, TABLE_LEN};
+
+    let zero = Ge {
+        x: [0; 5],
+        y: [0; 5],
+        z: [0; 5],
+        t: [0; 5],
+    };
+    let mut table = [zero; TABLE_LEN];
+    build_power_table(&mut table);
+
+    // Reinterpret the point array as u64 words for upload. `Ge` is five-limb
+    // field elements in u64 words, so this is a plain byte view with no
+    // padding (all fields are [u64; 5] and the struct is 4 of them).
+    let words: &[u64] = unsafe {
+        std::slice::from_raw_parts(table.as_ptr() as *const u64, core::group::TABLE_LEN * 20)
+    };
+    Ok(rustacuda::memory::DeviceBuffer::from_slice(words).unwrap())
+}
+
 pub fn cuda_try_loop(
     prefixes: &[String],
-    sender: crossbeam_channel::Sender<[u8; 32]>,
+    sender: crossbeam_channel::Sender<[u8; 64]>,
     tries_sender: crossbeam_channel::Sender<u64>,
 ) -> Result<(), Error> {
     use rustacuda::launch;
@@ -109,8 +136,6 @@ pub fn cuda_try_loop(
     use rustacuda::prelude::*;
     use std::ffi::CString;
 
-    // Create a context associated to this device
-    // TODO: keep alive
     rustacuda::init(CudaFlags::empty())?;
     let mut i = 0;
     for device in rustacuda::device::Device::devices()? {
@@ -132,11 +157,13 @@ pub fn cuda_try_loop(
                 .get_function(std::ffi::CStr::from_bytes_with_nul(b"render\0").unwrap())
                 .unwrap();
 
+            let mut table = upload_power_table().unwrap();
+
             // Create a stream to submit work to
             let stream = Stream::new(StreamFlags::NON_BLOCKING, None).unwrap();
 
             // Move seed and prefix to device
-            let mut seed = [0; 32];
+            let mut seed = [0u8; 32];
             let mut gpu_seed = DeviceBuffer::from_slice(&seed).unwrap();
 
             let mut byte_prefixes_owned: Vec<_> = prefixes
@@ -149,7 +176,6 @@ pub fn cuda_try_loop(
                 .collect();
             let mut gpu_byte_prefixes = DeviceBuffer::from_slice(&byte_prefixes).unwrap();
 
-            // Crate parameters
             let mut params = DeviceBox::new(&core::KernelParams {
                 seed: gpu_seed.as_device_ptr(),
                 byte_prefixes: gpu_byte_prefixes.as_device_ptr(),
@@ -157,7 +183,6 @@ pub fn cuda_try_loop(
             })
             .unwrap();
 
-            // calculate threads and blocks
             let fn_max_threads = function
                 .get_attribute(rustacuda::function::FunctionAttribute::MaxThreadsPerBlock)
                 .unwrap() as u32;
@@ -176,30 +201,35 @@ pub fn cuda_try_loop(
 
             let threads = *[
                 fn_max_threads,
-                gpu_max_threads,
-                gpu_max_registers / fn_registers,
+                gpu_max_threads.min(core::BLOCK as u32),
+                gpu_max_registers / fn_registers.max(1),
             ]
             .iter()
             .min()
             .unwrap();
-            let blocks = gpu_cores * gpu_max_threads / threads;
+            let blocks = (gpu_cores * gpu_max_threads / threads).max(1);
+
+            // Each launch examines BATCH keys per thread.
+            let keys_per_launch = threads as u64 * blocks as u64 * core::BATCH as u64;
 
             println!(
-                "Launching kernel on device #{} with {} threads and {} blocks",
-                i, threads, blocks
+                "Launching kernel on device #{} with {} threads and {} blocks \
+                 ({} keys per launch)",
+                i, threads, blocks, keys_per_launch
             );
 
             loop {
                 csprng.fill_bytes(&mut seed);
                 gpu_seed.copy_from(&seed).unwrap();
                 unsafe {
-                    launch!(kernel.render<<<blocks, threads, 0, stream>>>(params.as_device_ptr()))
-                        .unwrap();
+                    launch!(kernel.render<<<blocks, threads, 0, stream>>>(
+                        params.as_device_ptr(),
+                        table.as_device_ptr()
+                    ))
+                    .unwrap();
                 }
 
-                // The kernel launch is asynchronous, so we wait for the kernel to finish executing
                 stream.synchronize().unwrap();
-
                 gpu_byte_prefixes.copy_to(&mut byte_prefixes).unwrap();
 
                 for prefix in &mut byte_prefixes_owned {
@@ -207,13 +237,13 @@ pub fn cuda_try_loop(
                     prefix.success.copy_to(&mut success).unwrap();
                     if success {
                         prefix.success.copy_from(&false).unwrap();
-                        let mut out = [0; 32];
+                        let mut out = [0u8; 64];
                         prefix.out.copy_to(&mut out).unwrap();
                         sender.send(out).unwrap();
                     }
                 }
 
-                tries_sender.send(threads as u64 * blocks as u64).unwrap();
+                tries_sender.send(keys_per_launch).unwrap();
             }
         });
         i += 1;
@@ -293,11 +323,21 @@ fn main() {
     loop {
         use std::io::Write;
 
-        let seed = recv.recv().unwrap();
-        let esk: ed25519_dalek::ExpandedSecretKey =
-            (&ed25519_dalek::SecretKey::from_bytes(&seed).unwrap()).into();
+        // The kernel returns the 64-byte expanded key, so the pubkey comes
+        // straight from it with no host-side key derivation.
+        let expanded = recv.recv().unwrap();
+        let esk = ed25519_dalek::ExpandedSecretKey::from_bytes(&expanded[..]).unwrap();
         let pk: ed25519_dalek::PublicKey = (&esk).into();
         let onion = pubkey_to_onion(pk.as_bytes());
+
+        // Several threads can match the same prefix in one launch, and they
+        // all write to that prefix's single `out` slot, so the key read back
+        // may not be the one that matched. Verify before emitting it; a
+        // non-match just means we lost the race, and the search continues.
+        if !prefixes.iter().any(|p| onion.starts_with(p.as_str())) {
+            continue;
+        }
+
         println!("{}", onion);
         let mut f = std::fs::File::create(dst.join(onion)).unwrap();
         f.write_all(FILE_PREFIX).unwrap();

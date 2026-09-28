@@ -12,12 +12,31 @@ Now supports multiple prefixes!
 
 - [Install Rust](https://rustup.rs)
 - [Install Cuda](https://developer.nvidia.com/cuda-downloads)
-- `rustup install nightly`
-- `rustup target add nvptx64-nvidia-cuda`
-- `cargo install ptx-linker`
+- `rustup toolchain install nightly`
+- `rustup component add llvm-bitcode-linker --toolchain nightly`
+- `rustup target add nvptx64-nvidia-cuda --toolchain nightly`
 - `git clone https://github.com/dr-bonez/tor-v3-vanity`
 - `cd tor-v3-vanity`
 - `cargo +nightly install --path .`
+
+The kernel crate (`core/`) is compiled for `nvptx64-nvidia-cuda` with
+`--crate-type cdylib`, which makes rustc link the LLVM bitcode with
+`llvm-bitcode-linker` and emit the PTX that the binary embeds. This all
+happens in `build.rs`; `llvm-bitcode-linker` and the `nvptx64-nvidia-cuda`
+target must be installed for the nightly toolchain listed above.
+
+If CUDA is installed somewhere other than `/usr/local/cuda` or `/opt/cuda`,
+point the build at it with `CUDA_PATH`:
+
+- `CUDA_PATH=/path/to/cuda cargo +nightly install --path .`
+
+### Build options
+
+| Variable             | Default            | Purpose                                              |
+| -------------------- | ------------------ | ---------------------------------------------------- |
+| `CUDA_PATH`          | autodetected       | CUDA install root, used to find `libcudart`          |
+| `T3V_PTX_PROFILE`    | `release`          | Profile used to build the kernel crate               |
+| `T3V_PTX_RUSTFLAGS`  | none               | `RUSTFLAGS` for the kernel build only                |
 
 ## Usage
 

@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     // The device crate reads these with `option_env!`, so the nested cargo
     // rebuilds the kernel when they change -- but only if this script re-runs
     // too. Without these lines the sweep silently measures the previous build.
-    for tunables in ["T3V_BLOCK", "T3V_CHUNK", "T3V_BATCH"] {
+    for tunables in ["T3V_BLOCK", "T3V_CHUNK", "T3V_BATCH", "T3V_COMB_W"] {
         println!("cargo:rerun-if-env-changed={tunables}");
     }
 

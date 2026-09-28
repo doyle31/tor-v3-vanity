@@ -80,28 +80,22 @@ fn assert_crypto_rng<Rng: rand::CryptoRng>(rng: Rng) -> Rng {
     rng
 }
 
-/// Build the `[2^i]B` ladder on the host and upload it once per device.
+/// Build the base-point tables on the host and upload them once per device.
 ///
-/// The kernel needs this table to avoid recomputing the doubling ladder for
-/// every candidate key. It is 255 * 4 * 5 u64s = 40800 bytes.
-fn upload_power_table() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
-    use core::group::{build_power_table, Ge, TABLE_LEN};
+/// The kernel needs these to avoid recomputing the base-point ladder for every
+/// candidate key. `BaseTables` is the fixed-window comb over the scalar's bits
+/// (every window's subset sums, in Niels form) plus the walk step `8B`.
+fn upload_base_tables() -> Result<rustacuda::memory::DeviceBuffer<u64>, Error> {
+    use core::group::{build_comb_table, BaseTables, BASE_TABLE_WORDS};
 
-    let zero = Ge {
-        x: [0; 5],
-        y: [0; 5],
-        z: [0; 5],
-        t: [0; 5],
-    };
-    let mut table = [zero; TABLE_LEN];
-    build_power_table(&mut table);
+    // `BaseTables` is `#[repr(C)]` and contains nothing but `[u64; 5]`, so it has
+    // no padding and a flat u64 view of it is exact -- which
+    // `base_tables_layout_is_flat` in the core crate checks.
+    let mut base: BaseTables = unsafe { std::mem::zeroed() };
+    build_comb_table(&mut base.comb, &mut base.eight);
 
-    // Reinterpret the point array as u64 words for upload. `Ge` is five-limb
-    // field elements in u64 words, so this is a plain byte view with no
-    // padding (all fields are [u64; 5] and the struct is 4 of them).
-    let words: &[u64] = unsafe {
-        std::slice::from_raw_parts(table.as_ptr() as *const u64, core::group::TABLE_LEN * 20)
-    };
+    let words: &[u64] =
+        unsafe { std::slice::from_raw_parts(&base as *const BaseTables as *const u64, BASE_TABLE_WORDS) };
     Ok(rustacuda::memory::DeviceBuffer::from_slice(words).unwrap())
 }
 
@@ -145,7 +139,7 @@ pub fn start(
                 .get_function(std::ffi::CStr::from_bytes_with_nul(b"render\0").unwrap())
                 .unwrap();
 
-            let mut table = upload_power_table().unwrap();
+            let mut table = upload_base_tables().unwrap();
             let stream = Stream::new(StreamFlags::NON_BLOCKING, None).unwrap();
 
             let mut seed = [0u8; 32];

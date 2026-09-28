@@ -73,6 +73,90 @@ pub fn ge_eight() -> Ge {
     p
 }
 
+/// A precomputed addend in Niels form: `(Y+X, Y-X, 2dT)`.
+///
+/// This is ref10's `ge_precomp`. The point it stands for is the *affine*
+/// representative `(X:Y:1:T)` of the same curve point, which is the whole
+/// trick: the `Z2` factor of the addition formula is 1, so the `2*Z1*Z2` term
+/// of `ge_add` collapses to a field doubling and costs no multiply.
+#[derive(Copy, Clone)]
+pub struct Niels {
+    pub yplusx: Fe,
+    pub yminusx: Fe,
+    pub xy2d: Fe,
+}
+
+/// The neutral element `(0:1:1:0)` in Niels form.
+///
+/// `ge_madd` is a *unified* formula, so this is a valid addend: adding it
+/// returns `p` (up to the projective scale that the formula leaves in `Z`).
+/// That is what lets the comb below run its window loop with no branches.
+#[inline(always)]
+pub fn ge_niels_identity() -> Niels {
+    Niels {
+        yplusx: FE_ONE,
+        yminusx: FE_ONE,
+        xy2d: FE_ZERO,
+    }
+}
+
+/// Projective point -> Niels form, given `zi = p.z^-1`. Host side only.
+///
+/// **`zi` is not optional.** The Niels form fixes the addend's `Z` to 1, so a
+/// projective point with `Z != 1` has to be divided through by `Z` first:
+/// `Y+X` must be the affine `(Y + X)/Z`, and `2dT` the affine `2dT/Z`. Feeding
+/// `ge_madd` an un-normalised triple does not fail loudly -- it still returns a
+/// point satisfying `T*Z == X*Y` -- but it is a *different* point, because the
+/// `2*Z1*Z2` term silently loses its `Z2`. This is ref10's
+/// `ge_p3_to_precomp`, and its one-inversion-per-entry is why that function
+/// exists at all.
+pub fn ge_to_niels(p: &Ge, zi: &Fe) -> Niels {
+    let y = fe_mul(&p.y, zi);
+    let x = fe_mul(&p.x, zi);
+    Niels {
+        yplusx: fe_add(&y, &x),
+        yminusx: fe_sub(&y, &x),
+        xy2d: fe_mul(&fe_mul(&p.t, zi), &FE_D2),
+    }
+}
+
+/// Point addition with a Niels addend. **7M**, two multiplies cheaper than
+/// `ge_add`'s 9M, and the cheapest addition available for a fixed second
+/// operand.
+///
+/// ref10's `ge_madd`, with `Z2 = 1` folded into the addend:
+///
+/// ```text
+///     A = (Y1-X1) * yminusx
+///     B = (Y1+X1) * yplusx
+///     C = T1     * xy2d        (T1 * 2d * T2, with 2d*T2 precomputed)
+///     D = 2*Z1                  (2*Z1*Z2, with Z2 == 1 -- no multiply)
+///     E = B-A, F = D-C, G = D+C, H = B+A
+///     X3 = E*F, Y3 = G*H, Z3 = F*G, T3 = E*H
+/// ```
+///
+/// Three multiplies for the cross terms plus four for the output. Valid for
+/// every input, including `p == q` and `p` the identity, exactly like
+/// `ge_add`: the formula is unified. `madd_matches_add` in the tests checks
+/// that against `ge_add` directly.
+#[inline(always)]
+pub fn ge_madd(p: &Ge, q: &Niels) -> Ge {
+    let a = fe_mul(&fe_sub(&p.y, &p.x), &q.yminusx);
+    let b = fe_mul(&fe_add(&p.y, &p.x), &q.yplusx);
+    let c = fe_mul(&p.t, &q.xy2d);
+    let d = fe_add(&p.z, &p.z);
+    let e = fe_sub(&b, &a);
+    let f = fe_sub(&d, &c);
+    let g = fe_add(&d, &c);
+    let h = fe_add(&b, &a);
+    Ge {
+        x: fe_mul(&e, &f),
+        y: fe_mul(&g, &h),
+        z: fe_mul(&f, &g),
+        t: fe_mul(&e, &h),
+    }
+}
+
 /// Unified addition, valid for all inputs including the identity.
 /// 9M + 1D.
 #[inline(always)]
@@ -192,13 +276,13 @@ pub const TABLE_LEN: usize = 255;
 /// bits `i` of the scalar. That needs one point addition per set bit and **no
 /// doublings at all**.
 ///
-/// This is the whole point of hoisting the ladder out of the per-key work: a
-/// plain double-and-add recomputes `[2^i]B` for every key, and that ladder is
-/// identical for all of them.
-///
-/// A random 253-bit scalar has ~126 set bits, so this costs ~126 point
-/// additions versus the 512 of the naive `ed25519-compact` loop. The table is
-/// 255 * 4 * 5 * 8 = 40800 bytes, which fits in shared memory.
+/// **This is no longer what the kernel does** -- see `scalarmult_base_comb`.
+/// It is kept as the reference implementation that the comb is tested against,
+/// and because it is the cheapest way to read the cost of the old approach:
+/// the `if bit == 1` below is a divergent branch, so a warp executes the body
+/// on every bit that any of its 32 lanes has set. With 32 independent lanes
+/// that is ~251 of the 255 iterations, not the ~126 a single thread would
+/// pay, and a branchless rewrite would execute exactly the same ~251 additions.
 pub fn scalarmult_base_table(scalar: &[u8; 32], table: &[Ge]) -> Ge {
     let mut r = ge_identity();
     let mut first = true;
@@ -234,6 +318,181 @@ pub fn build_power_table(table: &mut [Ge; TABLE_LEN]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fixed-window comb over the base point.
+//
+// Why not just the power table above: on a GPU the `if bit == 1` in
+// `scalarmult_base_table` is a *divergent* branch, so a warp runs the body on
+// any bit that is set in *any* of its 32 lanes. The probability that all 32
+// lanes agree a given bit is zero is 2^-32, so the warp pays ~251 additions
+// where a single thread would pay ~126. Making the loop branchless does not
+// help: the body is still ~251 warp-level additions. Only a comb, whose
+// operation count does not depend on the scalar's sparsity at all, helps.
+//
+// The comb is "all subsets of a window": each window of `COMB_W` consecutive
+// scalar bits has its 2^COMB_W subset sums precomputed, so a window costs
+// exactly one addition whatever its digits are. That needs no doublings and
+// no digit sign flips, which matters because a doubling is 8M against an
+// addition's 9M in this representation -- see the notes in 01-comb.md.
+// ---------------------------------------------------------------------------
+
+/// Bits per comb window. Build-time tunable so it can be swept without code
+/// changes; see `01-comb.md` for the table-size / operation-count tradeoff.
+pub const COMB_W: usize = match option_env!("T3V_COMB_W") {
+    Some(s) => crate::parse_usize(s.as_bytes()),
+    None => 4,
+};
+
+/// Clamping clears scalar bits 0, 1 and 2 (`sk[0] & 248 == sk[0]`), so the comb
+/// starts at bit 3 and never needs those windows. It also forces bit 254
+/// (`sk[31] |= 64`) and clears bit 255, which is why the range ends at 254.
+pub const COMB_FIRST_BIT: usize = 3;
+
+/// Scalar bits 3..=254 inclusive.
+pub const COMB_BITS: usize = 252;
+
+/// Windows of `COMB_W` bits covering `COMB_BITS`. `COMB_W` must divide
+/// `COMB_BITS` so that no window runs off the top of the scalar.
+pub const COMB_WINDOWS: usize = COMB_BITS / COMB_W;
+
+/// Table slots per window: the identity (digit 0) plus every non-zero
+/// `COMB_W`-bit pattern.
+pub const COMB_SLOTS: usize = 1 << COMB_W;
+
+/// Total comb table entries.
+pub const COMB_LEN: usize = COMB_WINDOWS * COMB_SLOTS;
+
+/// Everything the kernel needs that depends only on the base point: the comb
+/// table and the walk step `8B`, both in Niels form.
+///
+/// `#[repr(C)]` with only `[u64; 5]` inside means the host can upload it as a
+/// flat `&[u64]` with no packing, and the device can index it directly.
+#[repr(C)]
+pub struct BaseTables {
+    pub comb: [Niels; COMB_LEN],
+    /// `8B`, the walk step. `table[3]` of a power table would be the same
+    /// point; it lives here so the walk needs no `[2^i]B` array at all.
+    pub eight: Niels,
+}
+
+/// u64 words in one `Niels` (three field elements, no padding).
+pub const NIELS_WORDS: usize = 15;
+
+/// u64 words in the whole uploaded blob.
+pub const BASE_TABLE_WORDS: usize = COMB_LEN * NIELS_WORDS + NIELS_WORDS;
+
+/// Fill `comb` with every window's subset sums, and `eight` with `8B`.
+///
+/// `comb[j*COMB_SLOTS + m]` (m in 1..COMB_SLOTS) is the sum of `[2^b]B` over
+/// the `b` with bit `b` of `m` set, taken from window `j` -- that is, over
+/// the scalar bit positions `COMB_FIRST_BIT + j*COMB_W + b`. Slot 0 is the
+/// identity, so a zero digit adds nothing and the window loop needs no branch.
+///
+/// The subset sums are built from the same `[2^i]B` powers the old ladder used,
+/// so the two implementations share one source of truth, and each window is
+/// normalised into Niels form with one *batched* inversion (Montgomery's trick)
+/// rather than one inversion per entry. Building the table costs a few
+/// thousand field multiplies, once, on the host.
+pub fn build_comb_table(comb: &mut [Niels; COMB_LEN], eight: &mut Niels) {
+    // 2..=4 is the useful range: COMB_W must also divide COMB_BITS (252), and
+    // the table is 2^COMB_W slots per window, so 5/6/7 are either impossible or
+    // absurdly large (315 KiB at 6, 540 KiB at 7). See `01-comb.md`.
+    assert!(
+        COMB_W >= 2 && COMB_W <= 4,
+        "T3V_COMB_W must be in 2..=4"
+    );
+    assert!(COMB_BITS % COMB_W == 0, "T3V_COMB_W must divide 252");
+
+    let zero = Ge {
+        x: FE_ZERO,
+        y: FE_ZERO,
+        z: FE_ZERO,
+        t: FE_ZERO,
+    };
+    let mut power = [zero; TABLE_LEN];
+    build_power_table(&mut power);
+
+    // Per-window scratch: the window's points, their Z coordinates, and the
+    // prefix products `batch_invert_into` needs.
+    let mut points = [zero; COMB_SLOTS];
+    let mut zs = [FE_ONE; COMB_SLOTS];
+    let mut scratch = [FE_ONE; COMB_SLOTS];
+
+    for j in 0..COMB_WINDOWS {
+        let base = COMB_FIRST_BIT + j * COMB_W;
+        for m in 0..COMB_SLOTS {
+            let mut acc = ge_identity();
+            let mut first = true;
+            for b in 0..COMB_W {
+                if (m >> b) & 1 == 1 {
+                    if first {
+                        // Assigning saves an addition against the identity.
+                        acc = power[base + b];
+                        first = false;
+                    } else {
+                        acc = ge_add(&acc, &power[base + b]);
+                    }
+                }
+            }
+            points[m] = acc;
+            zs[m] = acc.z;
+        }
+
+        // One inversion for the whole window: this is the step that makes the
+        // entries usable by `ge_madd`.
+        batch_invert_into(&mut zs, &mut scratch);
+        for m in 0..COMB_SLOTS {
+            comb[j * COMB_SLOTS + m] = ge_to_niels(&points[m], &zs[m]);
+        }
+    }
+
+    // The walk step, normalised the same way. `8B` used to be three doublings
+    // of the base point in *every thread* of *every launch*; it is now built
+    // once, here, and uploaded with the table.
+    let eight_point = ge_eight();
+    let zi = fe_invert(&eight_point.z);
+    *eight = ge_to_niels(&eight_point, &zi);
+}
+
+/// The `COMB_W` scalar bits of window `j`, as a table slot index in
+/// `0..COMB_SLOTS`.
+///
+/// `COMB_W <= 5` bits starting at a bit offset of at most 7 span at most 12
+/// bits, so a 16-bit read is always enough. The high byte is only *used* when
+/// the offset is 7, and then `byte + 1 <= 30`; when `byte == 31` (the top
+/// window) the read wraps to byte 0, lands at bit 5 or above after the shift,
+/// and is discarded by the mask -- so this is in bounds for every window
+/// without a bounds check or a branch.
+#[inline(always)]
+fn comb_slot(scalar: &[u8; 32], j: usize) -> usize {
+    let base = COMB_FIRST_BIT + j * COMB_W;
+    let byte = base >> 3;
+    let off = (base & 7) as u32;
+    let lo = scalar[byte] as u32;
+    let hi = scalar[(byte + 1) & 31] as u32;
+    (((lo | (hi << 8)) >> off) & (COMB_SLOTS as u32 - 1)) as usize
+}
+
+/// `[scalar]B` as a sum of precomputed window subset sums.
+///
+/// `COMB_WINDOWS` point additions and **no doublings**, whatever the scalar
+/// looks like -- the operation count is data independent, which is the entire
+/// point (see the divergence note above `COMB_W`).
+///
+/// The first window is added against the identity rather than assigned, because
+/// the accumulator has to be a `Ge` and a `Niels` cannot be one. `ge_madd` is
+/// unified, so that addition is exact and costs 7M like any other; at the
+/// default `COMB_W == 4` that is 63 additions against the ladder's ~251 per
+/// warp.
+pub fn scalarmult_base_comb(scalar: &[u8; 32], comb: &[Niels; COMB_LEN]) -> Ge {
+    let mut r = ge_madd(&ge_identity(), &comb[comb_slot(scalar, 0)]);
+    for j in 1..COMB_WINDOWS {
+        let addend = comb[j * COMB_SLOTS + comb_slot(scalar, j)];
+        r = ge_madd(&r, &addend);
+    }
+    r
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -254,6 +513,35 @@ mod tests {
         let mut t = [zero; TABLE_LEN];
         build_power_table(&mut t);
         t
+    }
+
+    /// The blob the host uploads, built once per test run.
+    fn comb_table() -> [Niels; COMB_LEN] {
+        let mut comb: [Niels; COMB_LEN] = unsafe { core::mem::zeroed() };
+        let mut eight: Niels = unsafe { core::mem::zeroed() };
+        build_comb_table(&mut comb, &mut eight);
+        comb
+    }
+
+    fn comb_eight() -> Niels {
+        let mut comb: [Niels; COMB_LEN] = unsafe { core::mem::zeroed() };
+        let mut eight: Niels = unsafe { core::mem::zeroed() };
+        build_comb_table(&mut comb, &mut eight);
+        eight
+    }
+
+    /// A deterministic xorshift, so the "random" scalars below are
+    /// reproducible and a failure can be replayed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
     }
 
     fn compress(p: &Ge) -> [u8; 32] {
@@ -301,6 +589,213 @@ mod tests {
             let p = scalarmult_base_table(&scalar, &table);
             assert_eq!(hex(&compress(&p)), want, "seed {}", seed_hex);
         }
+    }
+
+    /// The same RFC 8032 vectors, but through the comb. This is the check that
+    /// matters for the rewrite: an independent table layout and a different
+    /// addition formula, so agreeing with the published pubkey pins down both.
+    #[test]
+    fn comb_rfc8032_vectors() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            ),
+            (
+                "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            ),
+            (
+                "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+                "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            ),
+        ];
+
+        let comb = comb_table();
+        for (seed_hex, want) in cases {
+            let seed: Vec<u8> = unhex(seed_hex);
+            let expanded = sha512::sha512(&seed);
+            let mut scalar = [0u8; 32];
+            scalar.copy_from_slice(&expanded[..32]);
+            scalar[0] &= 248;
+            scalar[31] &= 63;
+            scalar[31] |= 64;
+
+            let p = scalarmult_base_comb(&scalar, &comb);
+            assert_eq!(hex(&compress(&p)), want, "seed {}", seed_hex);
+        }
+    }
+
+    /// `ge_madd` must agree with `ge_add` for every input, including the ones
+    /// a *non*-unified formula gets wrong: the two operands equal, and either
+    /// operand the identity. A comb walks into those cases constantly, because
+    /// two windows can easily select the same table entry.
+    #[test]
+    fn madd_matches_add() {
+        let mut q = ge_base();
+        let mut p = ge_base();
+        for i in 0..64 {
+            // Pseudo-random-ish steps, so the operands collide sometimes.
+            if i % 7 == 3 {
+                q = ge_double(&q);
+            } else if i % 11 == 5 {
+                p = ge_add(&p, &q);
+            }
+
+            // Deliberately projective: `p` and `q` have arbitrary Z, so this
+            // also covers the Niels normalisation done at table-build time.
+            let got = ge_madd(&p, &ge_to_niels(&q, &fe_invert(&q.z)));
+            let want = ge_add(&p, &q);
+            assert_eq!(hex(&compress(&got)), hex(&compress(&want)), "case {}", i);
+
+            // p == q (the doubling case) and the identity addend.
+            if i % 5 == 0 {
+                let got = ge_madd(&q, &ge_to_niels(&q, &fe_invert(&q.z)));
+                let want = ge_add(&q, &q);
+                assert_eq!(hex(&compress(&got)), hex(&compress(&want)), "self {}", i);
+            }
+            let got = ge_madd(&p, &ge_niels_identity());
+            let want = ge_add(&p, &ge_identity());
+            assert_eq!(hex(&compress(&got)), hex(&compress(&want)), "ident {}", i);
+        }
+    }
+
+    /// The comb must equal the power-table ladder on arbitrary clamped
+    /// scalars -- the cross-check that makes the RFC vectors more than three
+    /// lucky coincidences.
+    #[test]
+    fn comb_matches_power_ladder() {
+        let power = power_table();
+        let comb = comb_table();
+        let mut rng = Rng(0x1319_8A2E_0370_7344);
+        for i in 0..64 {
+            let mut scalar = [0u8; 32];
+            for b in scalar.iter_mut() {
+                *b = (rng.next() >> 24) as u8;
+            }
+            // Clamp, exactly as `BatchState::begin` does.
+            scalar[0] &= 248;
+            scalar[31] &= 63;
+            scalar[31] |= 64;
+
+            let got = scalarmult_base_comb(&scalar, &comb);
+            let want = scalarmult_base_table(&scalar, &power);
+            assert_eq!(
+                hex(&compress(&got)),
+                hex(&compress(&want)),
+                "case {} scalar {}",
+                i,
+                hex(&scalar)
+            );
+        }
+    }
+
+    /// Every comb slot, for every window, must be the subset sum it claims to
+    /// be. Checking the table directly catches a mis-indexed build that the
+    /// scalar-multiply comparison could hide behind a symmetric mistake.
+    #[test]
+    fn comb_slots_are_subset_sums() {
+        let power = power_table();
+        let comb = comb_table();
+        for j in 0..COMB_WINDOWS {
+            let base = COMB_FIRST_BIT + j * COMB_W;
+            for m in 0..COMB_SLOTS {
+                // Rebuild the slot the slow way, straight from the power table.
+                let mut want = ge_identity();
+                let mut first = true;
+                for b in 0..COMB_W {
+                    if (m >> b) & 1 == 1 {
+                        if first {
+                            want = power[base + b];
+                            first = false;
+                        } else {
+                            want = ge_add(&want, &power[base + b]);
+                        }
+                    }
+                }
+                assert_eq!(
+                    hex(&compress(&ge_madd(&ge_identity(), &comb[j * COMB_SLOTS + m]))),
+                    hex(&compress(&want)),
+                    "window {} slot {}",
+                    j,
+                    m
+                );
+            }
+        }
+    }
+
+    /// `comb_slot` must return exactly the bits the window spans, including at
+    /// the two ends of the scalar where the 16-bit read runs off the end.
+    #[test]
+    fn comb_slot_reads_the_right_bits() {
+        let mut scalar = [0u8; 32];
+        for (i, b) in scalar.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        for j in 0..COMB_WINDOWS {
+            let base = COMB_FIRST_BIT + j * COMB_W;
+            let want = (0..COMB_W).fold(0usize, |acc, b| {
+                acc | (((scalar[(base + b) >> 3] >> ((base + b) & 7)) & 1) as usize) << b
+            });
+            assert_eq!(comb_slot(&scalar, j), want, "window {}", j);
+        }
+    }
+
+    /// The uploaded `8B` must be the same point the old `make_eight` built.
+    #[test]
+    fn comb_eight_matches_make_eight() {
+        let n = comb_eight();
+        let mut want = ge_base();
+        for _ in 0..3 {
+            want = ge_double(&want);
+        }
+        let ident = ge_identity();
+        assert_eq!(
+            hex(&compress(&ge_madd(&ident, &n))),
+            hex(&compress(&want))
+        );
+        // And it is what the walk actually needs: [s]B + 8B == [s+8]B.
+        let power = power_table();
+        let mut scalar = [0u8; 32];
+        scalar[4] = 0x37;
+        scalar[0] = 0x40;
+        scalar[31] |= 64;
+        scalar[0] &= 248;
+        let walked = ge_madd(&scalarmult_base_table(&scalar, &power), &n);
+        let mut next = scalar;
+        add_clamped_scalar(&mut next, 8);
+        assert_eq!(
+            hex(&compress(&walked)),
+            hex(&compress(&scalarmult_base_table(&next, &power)))
+        );
+    }
+
+    /// The blob is `#[repr(C)]` with only `[u64; 5]` inside, so the host's flat
+    /// `u64` view of it is exact. If that ever stops holding, the host uploads
+    /// the wrong bytes and every key is garbage.
+    #[test]
+    fn base_tables_layout_is_flat() {
+        let mut base: BaseTables = unsafe { core::mem::zeroed() };
+        build_comb_table(&mut base.comb, &mut base.eight);
+        let p = &base as *const BaseTables as *const u8;
+        let comb = &base.comb as *const Niels as *const u8;
+        let eight = &base.eight as *const Niels as *const u8;
+        assert_eq!(
+            comb as usize - p as usize,
+            0,
+            "comb must start the struct"
+        );
+        assert_eq!(
+            eight as usize - p as usize,
+            COMB_LEN * NIELS_WORDS * 8,
+            "eight must follow comb with no padding"
+        );
+        assert_eq!(core::mem::size_of::<Niels>(), NIELS_WORDS * 8);
+        assert_eq!(
+            core::mem::size_of::<BaseTables>(),
+            BASE_TABLE_WORDS * 8,
+            "size_of must match BASE_TABLE_WORDS"
+        );
     }
 
     #[test]

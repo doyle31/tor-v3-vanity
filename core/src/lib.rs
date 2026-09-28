@@ -60,7 +60,7 @@ pub const BATCH: usize = match option_env!("T3V_BATCH") {
 /// Minimal compile-time `usize` parser: only leading decimal digits, no sign or
 /// whitespace, so a typo in an env var yields 0 (and trips the assertions in
 /// `render`) rather than a silent nonsense value.
-const fn parse_usize(bytes: &[u8]) -> usize {
+pub(crate) const fn parse_usize(bytes: &[u8]) -> usize {
     let mut out: usize = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -148,5 +148,8 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 pub const POINT_WORDS: usize = 20;
 
 /// The whole ladder, as flat u64 words: `TABLE_LEN * POINT_WORDS`.
+///
+/// Retained for the power-table reference path; the kernel itself now uploads
+/// `group::BASE_TABLE_WORDS` instead (see `group::BaseTables`).
 #[cfg(target_arch = "nvptx64")]
 pub const TABLE_WORDS: usize = group::TABLE_LEN * POINT_WORDS;

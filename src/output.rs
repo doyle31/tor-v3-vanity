@@ -326,6 +326,17 @@ fn resume_json_array(path: &Path) -> io::Result<u64> {
 }
 
 impl Sink {
+    /// True when `path` is, or will be, a regular file -- and so can be
+    /// fsynced. A path that does not exist yet will be created as a regular
+    /// file; a character device or FIFO never can be.
+    pub fn is_regular_file(path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(m) => m.is_file(),
+            // Not present yet: `File::create` below will make a regular file.
+            Err(_) => true,
+        }
+    }
+
     /// Open a sink for `path` in an explicit `format`, applying `existing` to a
     /// file that is already there.
     ///
@@ -347,6 +358,14 @@ impl Sink {
     /// * **JSON array** is one document, so the closing `]` has to be removed
     ///   before appending, or the new records land outside the array and the
     ///   file is no longer valid JSON. See [`resume_json_array`].
+    ///
+    /// # Note on the 4th argument
+    ///
+    /// This takes an [`Existing`] policy where it used to take none, because
+    /// overwriting an existing file silently was found to be a real hazard: a
+    /// search can run for hours and retyping `-o keys.csv` destroyed the
+    /// previous run with no error. The three-way policy is deliberate, so
+    /// dropping it here would drop the protection.
     pub fn open_format(
         path: &Path,
         format: Format,
@@ -359,7 +378,16 @@ impl Sink {
         // it is a distinct error rather than the `AlreadyExists` the OS would
         // give, because the remedy is not "pick another name" -- it is
         // `--append` or `--overwrite`.
-        if existing == Existing::Refuse && path.exists() {
+        //
+        // Only regular files are protected. A character device, FIFO or socket
+        // is a stream rather than a file holding results, and there is nothing
+        // to lose by opening it again: `--out /dev/stdout` is a supported way to
+        // pipe the records somewhere, and refusing it would make the flag
+        // useless. `is_regular_file` is what distinguishes the two cases.
+        if existing == Existing::Refuse
+            && path.exists()
+            && Self::is_regular_file(path)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(

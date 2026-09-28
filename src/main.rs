@@ -7,6 +7,7 @@
 //! * [`output`] decides where matched keypairs go.
 //! * `main` wires them together and runs the key-emission loop.
 
+use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -198,17 +199,65 @@ fn main() {
     }
 }
 
+/// Report an output failure once, then stop the search rather than losing
+/// keys silently. A closed pipe is the normal way a piped run ends; anything
+/// else is a real problem worth surfacing loudly.
+fn report_write_failure(what: &str, e: &std::io::Error, written: u64) {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        eprintln!("the reader closed the pipe; stopping after {written} keys");
+    } else {
+        eprintln!("error: writing {what} failed: {e}");
+        eprintln!("       stopping after {written} keys, rather than losing more silently");
+    }
+}
+
 fn search(opts: &cli::Options, launch: gpu::Launch) {
-    let prefixes = &opts.prefixes;
+    // Reject prefixes the kernel cannot test, before any worker starts.
+    //
+    // `BytePrefixOwned::from_str` asserts on these, and an assert that fires
+    // inside a worker thread tears down the *entire* search rather than
+    // skipping the one unusable prefix -- so a single over-long word out of
+    // a few hundred silently costs you all the others.
+    //
+    // The limit is not a policy choice. The kernel tests the low eight bytes
+    // of the encoding in a single 64-bit word, so a prefix reaching past
+    // byte 7 cannot be matched at all.
+    let (usable, rejected): (Vec<String>, Vec<String>) = opts
+        .prefixes
+        .iter()
+        .cloned()
+        .partition(|p| p.len() <= core::BytePrefix::MAX_PREFIX_CHARS);
+    if !rejected.is_empty() {
+        eprintln!(
+            "warning: {} prefix(es) longer than {} characters cannot be tested by the kernel \
+             and were skipped: {}",
+            rejected.len(),
+            core::BytePrefix::MAX_PREFIX_CHARS,
+            rejected.join(", ")
+        );
+    }
+    if usable.is_empty() {
+        eprintln!("error: no searchable prefixes remain");
+        return;
+    }
+    let prefixes = &usable;
     let max_len = prefixes
         .iter()
         .fold(0, |acc, x| std::cmp::max(acc, x.len()));
     // `--count N` stops after N keys; 0 means run until interrupted.
     let limit = opts.count;
-    let mut written: u64 = 0;
 
     // One of two sinks: a single consolidated file, or a directory of per-key
     // Tor key files.
+    //
+    // `consolidated` also decides where the human-facing lines go. When the
+    // records themselves are on stdout -- `--out /dev/stdout` into a pipe --
+    // the address line and the progress lines must not go there too: they
+    // are written through a different handle with a different buffer, so the
+    // two interleave and the stream is mostly garbage. Measured on a
+    // two-character prefix, 400 lines of `--out /dev/stdout` were 337 bare
+    // addresses and 63 CSV rows.
+    let mut sink_is_consolidated = false;
     let mut sink = match &opts.out {
         Some(path) => {
             let chosen = opts
@@ -227,22 +276,34 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
                 (output::Existing::Refuse, true) => "refusing to overwrite",
                 (output::Existing::Refuse, false) => "writing",
             };
+            // fsync per key is impossible on a pipe or device -- it fails
+            // with EINVAL, which used to surface as a panic on the first
+            // match. Downgrade instead, so `--out /dev/stdout` just works.
+            let mut durability = opts.durability;
+            if durability.is_durable() && !output::Sink::is_regular_file(path) {
+                eprintln!(
+                    "note: {} is not a regular file, so it cannot be fsynced; using buffered output",
+                    path.display()
+                );
+                durability = output::Durability::Buffered;
+            }
             eprintln!(
                 "Writing matches to {} ({}, {}, {})",
                 path.display(),
                 chosen.name(),
                 disposition,
-                match opts.durability {
+                match durability {
                     output::Durability::Durable => "fsync per key",
                     output::Durability::Buffered => "buffered",
                 }
             );
+            sink_is_consolidated = true;
             // A refusal is a user error, not a crash: report it and exit non-zero
             // with the remedy, rather than unwrapping into a panic.
-            match output::Sink::open_format(path, chosen, opts.durability, existing) {
-                Ok(s) => s,
+            match output::Sink::open_format(path, chosen, durability, existing) {
+                Ok(sink) => sink,
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    eprintln!("error: cannot open {}: {e}", path.display());
                     std::process::exit(1);
                 }
             }
@@ -280,15 +341,15 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             let dur = now.elapsed().as_secs_f64();
             let progress = tries / expected;
             if log_interval > Duration::from_secs(0) && last_log.elapsed() > log_interval {
-                println!("Tried {:.0} / {:.0} (expected) keys.", tries, expected);
-                println!(
+                eprintln!("Tried {:.0} / {:.0} (expected) keys.", tries, expected);
+                eprintln!(
                     "Running for {} / {} (expected).",
                     PrettyDur(to_chrono(dur)),
                     PrettyDur(to_chrono(dur / progress))
                 );
                 let dropped = dropped_keys.load(std::sync::atomic::Ordering::Relaxed);
                 if dropped > 0 {
-                    println!(
+                    eprintln!(
                         "WARNING: {} keys matched but were dropped -- a launch published \
                          more than the {} slots per prefix.",
                         dropped,
@@ -300,6 +361,7 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         }
     });
 
+    let mut written: u64 = 0;
     loop {
         // Check the signal on *every* iteration, not only when the channel is
         // idle. A busy search delivers matches faster than they can be drained,
@@ -346,13 +408,30 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             None => continue,
         };
 
-        println!("{}", onion);
-        sink.write(&output::Key {
+        // Both of these can fail once the reader has gone away. Neither is
+        // worth losing an hours-long search over, and a bare `unwrap()` did
+        // exactly that: a closed pipe, or a full disk, killed the run with a
+        // panic and lost every key after it.
+        // The address goes to stdout only when the records are going to
+        // files; otherwise stdout is the data stream and this would corrupt
+        // it, so it moves to stderr.
+        let addr_result = if sink_is_consolidated {
+            writeln!(std::io::stderr(), "{}", onion)
+        } else {
+            writeln!(std::io::stdout(), "{}", onion)
+        };
+        if let Err(e) = addr_result {
+            report_write_failure("the address", &e, written);
+            break;
+        }
+        if let Err(e) = sink.write(&output::Key {
             onion: onion.clone(),
             expanded,
             matched,
-        })
-        .unwrap();
+        }) {
+            report_write_failure("a key", &e, written);
+            break;
+        }
         written += 1;
 
         // `--count` stops the search once enough keys are on disk. The exit is
@@ -361,9 +440,9 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         // bracket, and the GPU threads are joined before CUDA is torn down.
         //
         // A key that arrived in the same batch as the one that hit the limit is
-        // not written, so the count is an exact "at least" bound rather than an
-        // overshoot -- the batch is drained from the channel in order and the
-        // loop breaks the moment the target is reached.
+        // not written, so the count is an exact bound rather than an overshoot:
+        // the batch is drained from the channel in order and the loop breaks the
+        // moment the target is reached.
         if limit != 0 && written >= limit {
             break;
         }
@@ -384,7 +463,11 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
     // record. It is also safe to call for CSV and JSON Lines, where it is just
     // a flush.
     if let Err(e) = sink.finish() {
-        eprintln!("error closing output: {}", e);
+        // A reader that closed the pipe is a normal way for a piped run to
+        // end, so it does not warrant an error line.
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("error closing output: {e}");
+        }
     }
 }
 

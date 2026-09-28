@@ -31,10 +31,21 @@ use rustacuda_derive::DeviceCopy;
 // overridable at *build* time via environment variables, which is what makes
 // sweeping them practical -- `T3V_CHUNK=4 cargo build --release`.
 //
-// Getting these wrong is expensive in a specific way: the kernel sat at 255
-// registers/thread, which is the hardware ceiling, leaving room for only 8
-// warps per SM against the 48 an SM can hold. The chunk buffers are a large
-// part of that, so CHUNK and MAXHITS have to be chosen together and measured.
+// The defaults below are the measured optimum for this kernel on an RTX 3050
+// laptop, and the reason is not obvious. A chunk is batch-inverted together,
+// so the inversion cost per candidate is 1/CHUNK, and a field inversion costs
+// about as much as 30 field multiplies -- more than the point arithmetic it
+// serves. So CHUNK wants to be as large as possible. BATCH amortises the
+// per-batch fixed cost (one SHA-512 and one scalar multiplication) over
+// CHUNK-sized chunks; the comb made the scalar multiplication ~3x cheaper,
+// which moved the optimum hard: BATCH=64/CHUNK=8 measured 62.9M keys/s and
+// BATCH=512/CHUNK=256 measures 138.9M.
+//
+// Going past this is not free. At CHUNK=256 the chunk buffers are 20 KiB per
+// thread of local memory, though registers *drop* to 168 (from the 255 ceiling)
+// because BATCH == CHUNK collapses the loop to a single chunk -- 12 warps per SM
+// instead of 8. CHUNK=512 ties on speed for double the memory, and BATCH=1024
+// is no better, so 512/256 is the knee.
 
 /// Threads per block. Only an upper bound: the host picks the real value from
 /// the kernel's register usage (see `--threads`).
@@ -47,14 +58,14 @@ pub const BLOCK: usize = match option_env!("T3V_BLOCK") {
 /// is also the inversion amortisation factor.
 pub const CHUNK: usize = match option_env!("T3V_CHUNK") {
     Some(s) => parse_usize(s.as_bytes()),
-    None => 8,
+    None => 256,
 };
 
 /// Candidates examined per thread per launch. Must be a multiple of `CHUNK`
 /// so that every chunk is full.
 pub const BATCH: usize = match option_env!("T3V_BATCH") {
     Some(s) => parse_usize(s.as_bytes()),
-    None => 64,
+    None => 512,
 };
 
 /// Minimal compile-time `usize` parser: only leading decimal digits, no sign or

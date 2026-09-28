@@ -167,62 +167,105 @@ fn fe_reduce(a: &Fe) -> Fe {
     r
 }
 
+/// Field subtraction, as `(a - b) mod p` in the canonical representative.
+///
+/// # Why this no longer uses i128
+///
+/// The previous version added a 2p bias held as six *i128* limbs, which forced
+/// a 128-bit add, subtract, shift and mask per limb. sm_86 has no 64-bit
+/// integer ALU at all, so a 128-bit add is four SASS instructions and a
+/// 128-bit shift is five: that formulation cost 171 SASS, more than 40% of a
+/// field multiply, to compute a difference. The i128 was only ever there to
+/// carry a possibly-negative digit; u64 carries the same information in the
+/// sign bit for free.
+///
+/// # The two digit chains
+///
+/// `a - b` in radix 2^51 is a borrow chain. Each digit is
+/// `a[i] - b[i] - borrow`, and with `a[i], b[i] < 2^51` that lies in
+/// `(-2^51, 2^51)`. Viewed as a two's-complement u64 that range has a simple
+/// signature: bit 51 is set exactly when the digit is negative, and masking off
+/// the low 51 bits gives the right digit either way. So one shift yields both
+/// the digit and the next borrow, in four SASS instructions, and nothing here
+/// is wider than 64 bits.
+///
+/// The chain leaves `(a - b) mod 2^255` in the limbs, and the borrow out says
+/// whether a 2^255 was handed back. `2^255 == 19 (mod p)`, so a set borrow owes
+/// 19, and a second five-limb chain pays it. That chain can itself go negative,
+/// but only when the value was below 19 -- so limbs 1..=4 came out of it as
+/// MASK, and one more limb-local `- 19` completes the correction.
 #[inline(always)]
 pub fn fe_sub(a: &Fe, b: &Fe) -> Fe {
-    // Bias by 2p, kept as a full 6-limb radix-2^51 value in u128 so the
-    // intermediate is exact. This is the standard ref10/donna formulation.
-    //
-    // 2p = 2^256 - 38 does not fit in five 51-bit limbs, so it needs a sixth.
-    // The sum a - b + 2p is a non-negative integer below 2^256, so masking
-    // each limb to 51 bits recovers its true digits with no borrow
-    // bookkeeping. The sixth limb (the 2^255 term) is dropped here and folded
-    // in as 19, because 2^255 == 19 (mod p).
-    //
     // Result is the canonical representative in [0, p).
-    // Correct radix-2^51 digits of 2p = 2^256 - 38, verified by reconstructing:
-    //     (2^51 - 38) + (2^51-1)(2^51 + 2^102 + 2^153 + 2^204) + 2^255 == 2p
-    // Limb 0 is 2^51 - 38, NOT 2*(2^51-19): the latter overflows one limb.
-    // The sixth limb is 1, i.e. one unit of 2^255.
-    const TWO_P: [u128; 6] = [
-        (1u128 << 51) - 38,
-        (1u128 << 51) - 1,
-        (1u128 << 51) - 1,
-        (1u128 << 51) - 1,
-        (1u128 << 51) - 1,
-        1,
+    let mut r = [0u64; 5];
+    let mut borrow = 0u64;
+    for i in 0..5 {
+        let t = a[i].wrapping_sub(b[i]).wrapping_sub(borrow);
+        borrow = (t >> 51) & 1;
+        r[i] = t & MASK;
+    }
+
+    let t0 = r[0].wrapping_sub(borrow * 19);
+    let mut under = (t0 >> 51) & 1;
+    r[0] = t0 & MASK;
+    for i in 1..5 {
+        let t = r[i].wrapping_sub(under);
+        under = (t >> 51) & 1;
+        r[i] = t & MASK;
+    }
+    // `under == 1` only when the whole value was below 19, so limbs 1..=4 came
+    // out of the loop as MASK and limb 0 owes 19 more to reach `r + p`.
+    r[0] -= under * 19;
+
+    // The exact-zero difference (a == b) lands on p, which is a valid residue
+    // but not the canonical zero, so a bare carry() is not enough: fe_reduce
+    // maps p back to 0.
+    fe_reduce(&r)
+}
+
+/// Normalise the five 128-bit accumulators of a schoolbook product.
+///
+/// Each accumulator holds a column of five 51x51 products plus the 19-folded
+/// wrap-around column, so it is under 2^109: its high half is under 2^45 and
+/// the carry out of the 51-bit split is under 2^58. Both fit in u64, which is
+/// the whole point. The previous chain re-derived every carry from the 128-bit
+/// value, so each step was a 128-bit shift (five SASS) plus a 128-bit add (four),
+/// and the final `c * 19` was a 128-bit *multiply*.
+///
+/// Splitting each accumulator into `lo`/`hi` u64 halves up front makes the
+/// propagation entirely 64-bit: a `>> 51` of a value below 2^109 is
+/// `(hi << 13) | (lo >> 51)`, and adding a carry into the next column is a
+/// 64-bit add with an explicit overflow test. `fe_reduce` carries the rest.
+#[inline(always)]
+fn carry_product(r0: u128, r1: u128, r2: u128, r3: u128, r4: u128) -> Fe {
+    let mut lo = [r0 as u64, r1 as u64, r2 as u64, r3 as u64, r4 as u64];
+    let mut hi = [
+        (r0 >> 64) as u64,
+        (r1 >> 64) as u64,
+        (r2 >> 64) as u64,
+        (r3 >> 64) as u64,
+        (r4 >> 64) as u64,
     ];
 
-    // Sum a - b + 2p across six limbs, propagating the carry between limbs.
-    // The carry propagation is essential: each limb's raw sum can reach ~2^52,
-    // and dropping that carry silently corrupts every limb above it.
-    //
-    // Ordering matters: add the bias *before* subtracting, so the intermediate
-    // is always non-negative and plain i128 arithmetic suffices. Since
-    // TWO_P[i] >= 2^51 - 38 and b[i] < 2^51, `a + bias - b` is positive.
-    let mut w = [0u64; 6];
-    let mut k = 0i128;
+    // Low to high. `fold` is the carry out of the limb below, always under
+    // 2^58, so it can overflow a 64-bit limb by at most one.
+    let mut fold: u64 = 0;
     for i in 0..5 {
-        let t = a[i] as i128 + TWO_P[i] as i128 + k - b[i] as i128;
-        w[i] = (t as u64) & MASK;
-        k = t >> 51;
+        let (s, ov) = lo[i].overflowing_add(fold);
+        hi[i] += ov as u64;
+        lo[i] = s;
+        fold = (hi[i] << 13) | (s >> 51);
+        lo[i] &= MASK;
     }
-    {
-        // Sixth limb: no a/b term, just the 2^255 term of 2p plus the carry.
-        let t = TWO_P[5] as i128 + k;
-        w[5] = (t as u64) & MASK;
-        k = t >> 51;
-    }
-    debug_assert_eq!(k, 0, "a - b + 2p must fit in six limbs");
 
-    // w[5] counts units of 2^255, and 2^255 == 19 (mod p).
-    let mut r = [w[0], w[1], w[2], w[3], w[4]];
-    r[0] = r[0].wrapping_add((w[5] as u64).wrapping_mul(19));
-
-    // Reduce fully. The +19 bias means the exact-zero difference (a == b) lands
-    // on p rather than 0, so a bare carry() is not enough: p is a valid residue
-    // but not the canonical representative of zero, and limb-wise comparisons
-    // against ZERO would fail. fe_reduce maps p back to 0.
-    fe_reduce(&carry(r))
+    // Limb 0 absorbed the top carry, scaled by 19 for the curve.
+    let mut r = [0u64; 5];
+    r[0] = lo[0].wrapping_add(fold * 19);
+    r[1] = lo[1];
+    r[2] = lo[2];
+    r[3] = lo[3];
+    r[4] = lo[4];
+    fe_reduce(&r)
 }
 
 #[inline(always)]
@@ -236,67 +279,90 @@ pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
         b[4] * 19,
     ];
 
-    let mut r0 = a[0] as u128 * b[0] as u128
+    let r0 = a[0] as u128 * b[0] as u128
         + a[1] as u128 * b19[4] as u128
         + a[2] as u128 * b19[3] as u128
         + a[3] as u128 * b19[2] as u128
         + a[4] as u128 * b19[1] as u128;
-    let mut r1 = a[0] as u128 * b[1] as u128
+    let r1 = a[0] as u128 * b[1] as u128
         + a[1] as u128 * b[0] as u128
         + a[2] as u128 * b19[4] as u128
         + a[3] as u128 * b19[3] as u128
         + a[4] as u128 * b19[2] as u128;
-    let mut r2 = a[0] as u128 * b[2] as u128
+    let r2 = a[0] as u128 * b[2] as u128
         + a[1] as u128 * b[1] as u128
         + a[2] as u128 * b[0] as u128
         + a[3] as u128 * b19[4] as u128
         + a[4] as u128 * b19[3] as u128;
-    let mut r3 = a[0] as u128 * b[3] as u128
+    let r3 = a[0] as u128 * b[3] as u128
         + a[1] as u128 * b[2] as u128
         + a[2] as u128 * b[1] as u128
         + a[3] as u128 * b[0] as u128
         + a[4] as u128 * b19[4] as u128;
-    let mut r4 = a[0] as u128 * b[4] as u128
+    let r4 = a[0] as u128 * b[4] as u128
         + a[1] as u128 * b[3] as u128
         + a[2] as u128 * b[2] as u128
         + a[3] as u128 * b[1] as u128
         + a[4] as u128 * b[0] as u128;
 
-    // Carry chain, folding the top limb back with the curve's factor of 19.
-    let mask = MASK as u128;
-    let mut c: u128;
-    c = r0 >> 51;
-    r0 &= mask;
-    r1 += c;
-    c = r1 >> 51;
-    r1 &= mask;
-    r2 += c;
-    c = r2 >> 51;
-    r2 &= mask;
-    r3 += c;
-    c = r3 >> 51;
-    r3 &= mask;
-    r4 += c;
-    c = r4 >> 51;
-    r4 &= mask;
-    r0 += c * 19;
-    c = r0 >> 51;
-    r0 &= mask;
-    r1 += c;
-    c = r1 >> 51;
-    r1 &= mask;
-    r2 += c;
-
-    // The product can land in [p, 2p), so reduce to the canonical
-    // representative. Without this, `fe_mul(a, a.invert())` yields the limb
-    // vector for p+1 rather than 1: same field element, different limbs, and
-    // every limb-wise equality check downstream would fail.
-    fe_reduce(&[r0 as u64, r1 as u64, r2 as u64, r3 as u64, r4 as u64])
+    carry_product(r0, r1, r2, r3, r4)
 }
 
+/// Squaring, via the squaring formula.
+///
+/// # 15 products instead of 25
+///
+/// With `a = sum a_i R^i` and `R = 2^51`, the off-diagonal products appear
+/// twice, so the column sums are
+///
+/// ```text
+/// c0 = a0^2                + 38 (a1 a4 + a2 a3)
+/// c1 = 2 a0 a1             + 38 a2 a4 + 19 a3^2
+/// c2 = 2 a0 a2 + a1^2      + 38 a3 a4
+/// c3 = 2 a0 a3 + 2 a1 a2  + 19 a4^2
+/// c4 = 2 a0 a4 + 2 a1 a3  + a2^2
+/// ```
+///
+/// That is 5 squares plus 10 cross products against `fe_mul`'s 25, so ten of
+/// the twenty-five 64x64 multiplies disappear, and each column sums three
+/// terms instead of five, so the 128-bit accumulate count drops from 20 to 10.
+///
+/// `fe_sq` used to *be* `fe_mul(a, a)`. LLVM's CSE does recover the duplicate
+/// off-diagonal products there, which is why the naive count only fell from 25
+/// to 15 rather than staying at 25; what it cannot recover is the shorter
+/// accumulation, and that is a third of the win. Measured on sm_86:
+/// `fe_sq` goes 352 -> 264 SASS, of which the multiply-pipe part goes
+/// 161 -> 124 IMAD.
+///
+/// The factors of 2 and of 19 are folded into a *multiplicand* rather than
+/// applied to the 102-bit result: doubling a u128 costs four SASS, whereas
+/// scaling a 51-bit limb by 2 or 19 costs one. `b2[i] = 2 a_i`,
+/// `b19[i] = 19 a_i` and `b38[i] = 2 b19[i] = 38 a_i` cover every case with
+/// ten multiplies and five shifts.
 #[inline(always)]
 pub fn fe_sq(a: &Fe) -> Fe {
-    fe_mul(a, a)
+    let b2 = [a[0] * 2, a[1] * 2, a[2] * 2, a[3] * 2, a[4] * 2];
+    let b19 = [a[0] * 19, a[1] * 19, a[2] * 19, a[3] * 19, a[4] * 19];
+    // 38 = 2 * 19, so this is a shift of b19, not a second multiply.
+    let b38 = [b19[0] * 2, b19[1] * 2, b19[2] * 2, b19[3] * 2, b19[4] * 2];
+
+    let r0 = a[0] as u128 * a[0] as u128
+        + a[1] as u128 * b38[4] as u128
+        + a[2] as u128 * b38[3] as u128;
+    let r1 = a[0] as u128 * b2[1] as u128
+        + a[2] as u128 * b38[4] as u128
+        + a[3] as u128 * b19[3] as u128;
+    let r2 = a[0] as u128 * b2[2] as u128
+        + a[1] as u128 * a[1] as u128
+        + a[3] as u128 * b38[4] as u128;
+    let r3 = a[0] as u128 * b2[3] as u128
+        + a[1] as u128 * b2[2] as u128
+        + a[4] as u128 * b19[4] as u128;
+    let r4 = a[0] as u128 * b2[4] as u128
+        + a[1] as u128 * b2[3] as u128
+        + a[2] as u128 * a[2] as u128;
+
+    carry_product(r0, r1, r2, r3, r4)
 }
 
 /// z^(2^255 - 21) = z^-1, via the standard addition chain.
@@ -584,6 +650,103 @@ mod tests {
             };
             let ai = fe_invert(&a);
             assert_eq!(fe_mul(&a, &ai), FE_ONE, "case {}", i);
+        }
+    }
+
+    /// A spread of operand shapes chosen to break arithmetic that happens to
+    /// work on uniform random inputs.
+    ///
+    /// The important members are the ones with many limbs equal to `MASK`
+    /// (2^51 - 1). `fe_reduce`'s "is the value at least p" test is a comparison
+    /// against p's digits, and p's top four digits *are* `MASK`, so an operand
+    /// full of `MASK` limbs is exactly the input that separates "every top limb
+    /// equals MASK" (>= p) from "some top limb equals MASK" (< p). A uniform
+    /// random sweep essentially never produces one, which is how a wrong
+    /// comparison can sit there passing the RFC 8032 vectors.
+    fn adversarial() -> Vec<Fe> {
+        let mut v: Vec<Fe> = vec![
+            [0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [3, 5, 7, 11, 13],
+            [MASK, MASK, MASK, MASK, MASK],
+            [MASK, MASK, MASK, MASK, 0],
+            [0, MASK, MASK, MASK, MASK],
+            [MASK, 0, MASK, 0, MASK],
+            [0, 0, 0, 0, 18],
+            [18, 0, 0, 0, 0],
+            [19, 0, 0, 0, 0],
+            [20, 0, 0, 0, 0],
+            [MASK - 18, MASK, MASK, MASK, MASK], // p - 1
+            [MASK - 19, MASK, MASK, MASK, MASK], // p
+            [MASK - 20, MASK, MASK, MASK, MASK], // p + 1
+        ];
+        let mut s: u64 = 0x243F_6A88_85A3_08D3;
+        let mut bit = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s & MASK
+        };
+        for _ in 0..256 {
+            // Two thirds of the limbs pinned to MASK.
+            v.push([
+                if bit() % 3 == 0 { bit() } else { MASK },
+                if bit() % 3 == 0 { bit() } else { MASK },
+                if bit() % 3 == 0 { bit() } else { MASK },
+                if bit() % 3 == 0 { bit() } else { MASK },
+                if bit() % 3 == 0 { bit() } else { MASK },
+            ]);
+        }
+        v
+    }
+
+    /// `c * (a + b) == c * a + c * b`, over the adversarial operand shapes.
+    ///
+    /// This is the identity that pins down `fe_reduce`. Every operation feeds
+    /// the next, so a reduction that is wrong on inputs with many maximal limbs
+    /// makes the two sides disagree even though each side is internally
+    /// consistent -- the failure mode that `fe_sq` vs `fe_mul` and the RFC 8032
+    /// vectors both miss, because they run `fe_reduce` on identical values.
+    #[test]
+    fn mul_distributes_over_add() {
+        let cases = adversarial();
+        for a in cases.iter() {
+            for b in cases.iter() {
+                for c in cases.iter() {
+                    let lhs = fe_mul(&fe_add(a, b), c);
+                    let rhs = fe_add(&fe_mul(a, c), &fe_mul(b, c));
+                    assert_eq!(lhs, rhs, "c*(a+b) for {:?} {:?} {:?}", a, b, c);
+                }
+            }
+        }
+    }
+
+    /// `fe_sq` is no longer `fe_mul(a, a)`, so pin it against `fe_mul` over both
+    /// the fixed edge cases and a pseudo-random sweep. A wrong squaring formula
+    /// has a habit of being invisible in the RFC 8032 vectors.
+    #[test]
+    fn sq_is_mul_of_self() {
+        for a in adversarial().iter() {
+            assert_eq!(fe_sq(a), fe_mul(a, a), "fe_sq(a) must equal fe_mul(a, a)");
+        }
+    }
+
+    /// `a - b == a + (0 - b)`, over the same adversarial shapes.
+    ///
+    /// The `- 19` that the second digit chain owes only fires when the borrow
+    /// out of `a - b` is set, i.e. when `a < b`; and it can itself go negative
+    /// only when the result is below 19. The adversarial list contains `18`,
+    /// `19`, `20` and `MASK` limbs precisely to reach each of those branches.
+    #[test]
+    fn sub_is_add_of_negation() {
+        let cases = adversarial();
+        for a in cases.iter() {
+            for b in cases.iter() {
+                assert_eq!(fe_sub(a, b), fe_add(a, &fe_sub(&FE_ZERO, b)));
+                for limb in fe_sub(a, b).iter() {
+                    assert!(*limb <= MASK, "fe_sub left limb {} over 2^51", limb);
+                }
+            }
         }
     }
 

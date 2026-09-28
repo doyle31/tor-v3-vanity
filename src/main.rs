@@ -367,14 +367,20 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         // The address goes to stdout only when the records are going to
         // files; otherwise stdout is the data stream and this would corrupt
         // it, so it moves to stderr.
-        let addr_result = if sink_is_consolidated {
-            writeln!(std::io::stderr(), "{}", onion)
-        } else {
-            writeln!(std::io::stdout(), "{}", onion)
-        };
-        if let Err(e) = addr_result {
-            report_write_failure("the address", &e, written);
-            break;
+        // The record already contains the address, so while streaming it is
+        // pure noise -- one line per key, for an overnight run. It stays on
+        // stdout in per-key mode, where that is the long-standing behaviour
+        // and the only way to see keys as they land.
+        if !sink_is_consolidated {
+            if let Err(e) = writeln!(std::io::stdout(), "{}", onion) {
+                report_write_failure("the address", &e, written);
+                break;
+            }
+        } else if opts.print_addresses {
+            if let Err(e) = writeln!(std::io::stderr(), "{}", onion) {
+                report_write_failure("the address", &e, written);
+                break;
+            }
         }
         if let Err(e) = sink.write(&output::Key {
             onion: onion.clone(),

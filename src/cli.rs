@@ -58,6 +58,8 @@ pub struct Options {
     pub blocks_per_sm: Option<u32>,
     /// How hard to push each key to disk.
     pub durability: output::Durability,
+    /// Echo each match's address on stderr while streaming records.
+    pub print_addresses: bool,
 }
 
 /// Parse the process arguments.
@@ -171,6 +173,7 @@ pub fn parse() -> Options {
             .get_one::<String>("blocks-per-sm")
             .map(|p| p.parse().expect("--blocks-per-sm takes a count")),
         durability,
+        print_addresses: m.get_flag("print-addresses"),
     }
 }
 
@@ -286,6 +289,13 @@ fn app() -> Command {
                 .help("Blocks per SM to launch. Default: fill the device"),
         )
         // --- durability -------------------------------------------------------
+        .arg(
+            Arg::new("print-addresses")
+                .long("print-addresses")
+                .action(ArgAction::SetTrue)
+                .help("Echo each matched address on stderr; off by default when --out is \
+streaming records, since the record already contains it"),
+        )
         .arg(
             Arg::new("fsync")
                 .long("fsync")

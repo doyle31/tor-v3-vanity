@@ -95,6 +95,23 @@ pub struct KernelParams {
     pub seed: DevicePointer<u8>,
     pub byte_prefixes: DevicePointer<BytePrefix>,
     pub byte_prefixes_len: usize,
+    /// One `u64` per thread, written only by the no-prefix (`--bench`) path.
+    ///
+    /// This is a guard, not a fix. The no-prefix path walks a `BatchState` that
+    /// nothing reads afterwards, which is exactly the shape dead-code
+    /// elimination targets: the whole point-addition chain is one store away
+    /// from being deleted, and `--bench` would then report a "key generation"
+    /// rate for a kernel doing none. Writing the final walking point here makes
+    /// the chain observable through a volatile store.
+    ///
+    /// At the time this was added the walk was **not** actually being deleted:
+    /// adding the store left the compiled kernel at 23,128 instructions, byte
+    /// for byte the same instruction count as without it, and `--bench` still
+    /// reported 511M keys/s. So the benchmark was already measuring the walk.
+    /// The guard is kept because the exposure is real and the cost is one 8-byte
+    /// store per thread, but it is not what explains the throughput numbers --
+    /// see the note in `kernel.conf`.
+    pub bench_sink: DevicePointer<u64>,
 }
 
 /// Expanded keys captured per prefix per launch.
@@ -102,18 +119,35 @@ pub struct KernelParams {
 /// Each prefix used to have a single 64-byte output slot plus a `success`
 /// flag, so a launch could return at most **one** key per prefix no matter how
 /// many it found. The host then read that slot once per launch and reset it.
-/// With 1,310,720 keys per launch, a 2-character prefix matches ~1,280 times
-/// per launch and a 3-character prefix ~40, but only one survived.
 ///
-/// Measured effect: the GPU ran at 39M keys/s while keys actually arrived at
-/// 24/s -- one per 1.6 million tried, where the expected rate is one per 1,024.
+/// A ring fixes it. The size is set by the *matches per launch*, which is
+/// `keys_per_launch / 2^(5 * chars)`. At the shipping geometry -- 128 threads
+/// x 240 blocks x 512 batch = **15,728,640 keys per launch** -- that is:
 ///
-/// A ring fixes it, and the readback is proportional to the keys *actually
-/// captured*, not to the ring size, so a generous ring costs one allocation and
-/// no extra transfer. 2048 slots covers the matches per launch of a 2-character
-/// prefix (~1,280) with headroom, after which the only limit is the GPU itself.
-/// Prefixes of 3 characters or more (~40 matches per launch) never fill it.
-pub const SLOTS: usize = 2048;
+/// | chars | matches per launch | fits in 16384? |
+/// |---|---|---|
+/// | 1 | 491,520 | no |
+/// | 2 | 15,360 | yes |
+/// | 3 | 480 | yes |
+/// | 4 | 15 | yes |
+///
+/// A 1-character search matches 1 key in 32, so no affordable ring holds a
+/// launch's worth; that case is reported by the `dropped_keys` warning rather
+/// than silently truncated. Two characters is the shortest prefix worth
+/// enumerating, and 16384 holds it with headroom.
+///
+/// This constant has to be re-checked whenever `keys_per_launch` moves. It was
+/// last sized against 1,310,720 keys per launch, when 2048 slots covered a
+/// 2-character launch. Raising `batch`/`chunk` took keys per launch up 12x and
+/// the ring was not revisited, which silently dropped 86.7% of 2-character
+/// matches (99.5% at 1 character) until it was caught. Prefer sizing this
+/// *from* the geometry over reusing a previous value.
+///
+/// Cost of the size: `SLOTS * SLOT_BYTES` per prefix -- 1 MiB at 16384, against
+/// 128 KiB at 2048 -- and the whole ring is read back per launch because
+/// `copy_to` requires equal lengths. At the measured ~14.5 launches/s that is
+/// ~15 MB/s, which is ~0.1% of a PCIe 3.0 x16 link.
+pub const SLOTS: usize = 16384;
 
 /// Bytes of expanded key per slot.
 pub const SLOT_BYTES: usize = 64;

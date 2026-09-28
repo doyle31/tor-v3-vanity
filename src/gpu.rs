@@ -232,19 +232,27 @@ pub fn start(
             }
             let mut gpu_byte_prefixes = DeviceBuffer::from_slice(&byte_prefixes).unwrap();
 
-            let mut params = DeviceBox::new(&core::KernelParams {
-                seed: gpu_seed.as_device_ptr(),
-                byte_prefixes: gpu_byte_prefixes.as_device_ptr(),
-                byte_prefixes_len: real_len,
-            })
-            .unwrap();
-
             let matching = real_len > 0;
             let (threads, blocks, keys_per_launch) =
                 geometry(&device, &function, &launch);
             if launch.verbose {
                 report_geometry(&device, &function, i, threads, blocks, keys_per_launch, matching);
             }
+
+            // One u64 per thread, written by the no-prefix (`--bench`) path and
+            // never read back. It exists so the walk is not dead code; see
+            // `KernelParams::bench_sink` for why that exposure is worth closing
+            // even though the walk is not currently being deleted.
+            let mut bench_sink: DeviceBuffer<u64> =
+                DeviceBuffer::from_slice(&vec![0u64; threads as usize * blocks as usize]).unwrap();
+
+            let mut params = DeviceBox::new(&core::KernelParams {
+                seed: gpu_seed.as_device_ptr(),
+                byte_prefixes: gpu_byte_prefixes.as_device_ptr(),
+                byte_prefixes_len: real_len,
+                bench_sink: bench_sink.as_device_ptr(),
+            })
+            .unwrap();
 
             // Staging buffer for the capture ring, allocated once and reused:
             // `copy_to` insists on a full-length destination.
@@ -283,8 +291,10 @@ pub fn start(
                     }
                     // `copy_to` requires equal lengths and rustacuda has no
                     // sub-range copy, so the whole ring comes back and only the
-                    // captured prefix is used. At SLOTS=2048 that is 128 KiB per
-                    // launch against a ~34 ms launch: ~0.04% of the budget.
+                    // captured prefix is used. At SLOTS=16384 that is 1 MiB per
+                    // prefix per launch; at the measured ~14.5 launches/s and
+                    // ~69 ms per launch that is ~15 MB/s, about 0.1% of a PCIe
+                    // 3.0 x16 link and ~0.3% of the launch.
                     prefix.out.copy_to(&mut ring).unwrap();
                     for k in 0..captured {
                         let mut out = [0u8; 64];

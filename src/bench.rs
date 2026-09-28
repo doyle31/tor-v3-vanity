@@ -126,18 +126,25 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> f64 {
         }
         let mut child = cmd.spawn().expect("failed to launch search");
 
-        // Counting the file is the ground truth: it is what a real search
-        // produced, including anything the host had to verify and discard.
-        let mut counted = 0u64;
-        while start.elapsed().as_secs() < secs {
-            std::thread::sleep(Duration::from_millis(500));
-            counted = std::fs::read_to_string(&out)
-                .map(|s| s.lines().filter(|l| !l.starts_with("onion,")).count() as u64)
-                .unwrap_or(0);
-        }
+        // Let the child run, then read the file exactly once.
+        //
+        // This used to poll: sleep 500 ms, re-read the whole output file, count
+        // the lines, repeat. At a 1- or 2-character prefix that is tens of MB/s
+        // of reads *inside the measured window*, competing with the child for
+        // page cache and CPU, so the reported rate was partly a measurement of
+        // the harness. Nothing needs the intermediate samples -- the child is
+        // killed at the end and the file on disk is the whole result -- so
+        // sample once, after the kill.
+        std::thread::sleep(Duration::from_secs(secs));
         let elapsed = start.elapsed().as_secs_f64();
         let _ = child.kill();
         let _ = child.wait();
+
+        // Counting the file is the ground truth: it is what a real search
+        // produced, including anything the host had to verify and discard.
+        let counted = std::fs::read_to_string(&out)
+            .map(|s| s.lines().filter(|l| !l.starts_with("onion,")).count() as u64)
+            .unwrap_or(0);
 
         let rate = counted as f64 / elapsed;
         best = best.max(rate);

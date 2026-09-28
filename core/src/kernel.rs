@@ -274,6 +274,17 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, base_ptr: *cons
                 state.advance();
             }
         }
+        // Keep the walk alive. Nothing below reads `state`, so without this
+        // store every write `advance()` makes is dead and LLVM deletes the
+        // entire point-addition chain -- this path would then measure only
+        // SHA-512, the comb build and a scalar increment. See
+        // `KernelParams::bench_sink`.
+        // `as_raw()` hands back a `*const` in this rustacuda version, so cast:
+        // the buffer is genuinely written, just never read back.
+        unsafe {
+            let sink = (params.bench_sink.as_raw() as *mut u64).add(tid as usize);
+            core::ptr::write_volatile(sink, state.cur.y[0]);
+        }
         return;
     }
 

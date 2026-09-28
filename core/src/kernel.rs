@@ -55,7 +55,7 @@ use super::{KernelParams, SLOT_BYTES, SLOTS};
 #[cfg(target_arch = "nvptx64")]
 use super::field::FE_ONE;
 #[cfg(target_arch = "nvptx64")]
-use super::group::{batch_invert_into, COMB_BITS, COMB_LEN, COMB_W};
+use super::group::{batch_invert_stride2_into, stride2_scratch_len, COMB_BITS, COMB_LEN, COMB_W};
 #[cfg(target_arch = "nvptx64")]
 use super::{BATCH, BLOCK, CHUNK};
 
@@ -268,7 +268,12 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, base_ptr: *cons
     // destroys occupancy. Re-walking costs CHUNK extra point additions, which
     // is far cheaper than the CHUNK-1 saved inversions (each ~254 squarings).
     let mut zs = [FE_ONE; CHUNK];
-    let mut scratch = [FE_ONE; CHUNK];
+    // Only every other prefix product of `batch_invert_into` is stored; the
+    // peel rebuilds the missing ones with one extra multiply apiece. That
+    // halves this array (10 KiB -> 5 KiB per thread at CHUNK=256) for
+    // CHUNK/2 extra field multiplies per chunk. See `SCRATCH.md` for whether
+    // that is a good trade -- it is measured, not assumed.
+    let mut scratch = [FE_ONE; stride2_scratch_len(CHUNK)];
 
     for _ in 0..(BATCH / CHUNK) {
         // Checkpoint so the second pass can replay the chunk exactly.
@@ -283,7 +288,7 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, base_ptr: *cons
         }
 
         // One inversion serves the whole chunk.
-        batch_invert_into(&mut zs, &mut scratch);
+        batch_invert_stride2_into(&mut zs, &mut scratch);
 
         // Pass 2: replay the same points and check them. Advancing *after*
         // each check leaves the state on the first candidate of the next
@@ -328,7 +333,10 @@ mod tests {
     // `render` is device-only, so its imports are cfg'd to the device build.
     // The tests below exercise the same maths, so pull in the ones they need.
     use crate::field::{fe_invert, FE_ONE};
-    use crate::group::{batch_invert_into, build_power_table, scalarmult_base_table, TABLE_LEN};
+    use crate::group::{
+        batch_invert_stride2_into, build_power_table, scalarmult_base_table, stride2_scratch_len,
+        TABLE_LEN,
+    };
     use crate::{BATCH, CHUNK};
 
     /// The host-built blob the kernel actually receives, plus the power table
@@ -447,7 +455,7 @@ mod tests {
         st.begin(&seed, &t.base);
 
         let mut zs = [FE_ONE; CHUNK];
-        let mut scratch = [FE_ONE; CHUNK];
+        let mut scratch = [FE_ONE; stride2_scratch_len(CHUNK)];
 
         // Sequential reference: pubkey of every candidate.
         let mut reference = BatchState::new();
@@ -469,7 +477,7 @@ mod tests {
                 st.cur = p;
                 zs[c] = p.z;
             }
-            batch_invert_into(&mut zs, &mut scratch);
+            batch_invert_stride2_into(&mut zs, &mut scratch);
 
             st.cur = start;
             for c in 0..CHUNK {

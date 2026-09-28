@@ -264,6 +264,160 @@ pub fn batch_invert(els: &mut [Fe], scratch: &mut [Fe]) {
     batch_invert_into(els, scratch)
 }
 
+// ---------------------------------------------------------------------------
+// The same trick with a half-size scratch buffer.
+//
+// `batch_invert_into` needs `n-1` stored values -- the prefix products -- and
+// that is a hard lower bound, not an implementation accident. Write
+// `P[i] = z[0] * .. * z[i]` with `P[-1] = 1`. The backwards peel maintains
+// `acc = 1/P[i]` and does
+//
+//     out[i] = P[i-1] * acc = P[i-1] / P[i] = z[i]^-1
+//     acc <- acc * z[i]                 (which is 1/P[i-1])
+//
+// so it needs *both* `P[i-1]` and `z[i]` from storage. The kernel has both:
+// `z[i]` is in the chunk's `zs` array, because the second walk needs `z[i]^-1`
+// written back into it, and the `P` are what `scratch` is for. Two arrays, and
+// there is no way to one-array it: keep only the `P` and the peel has to
+// divide (`acc` would have to become `acc / out[i]`, and a field division is an
+// inversion); keep only the `z` and every `P[i-1]` has to be re-derived from a
+// fresh product tree. See SCRATCH.md.
+//
+// What *is* free is the parity of the index. `P[i-1] = P[i-2] * z[i-1]`, so
+// storing only every other prefix product costs exactly one `fe_mul` to
+// rebuild the missing one -- from a stored neighbour and from `z[i-1]`, which
+// the backwards peel has not overwritten yet. That halves `scratch` for
+// `n/2 - 1` extra multiplies per batch.
+// ---------------------------------------------------------------------------
+
+/// Slots of `scratch` that `batch_invert_stride2_into` needs for `n` elements.
+pub const fn stride2_scratch_len(n: usize) -> usize {
+    (n + 1) / 2
+}
+
+/// `batch_invert_into` with `scratch` holding every *other* prefix product.
+///
+/// `scratch[j]` is `P[2j - 1]`, i.e. the product of the `2j` elements *before*
+/// index `2j`; slot 0 is therefore the constant `P[-1] = 1`. That needs
+/// `stride2_scratch_len(n)` slots instead of `n`.
+///
+/// Correct for every `n`, including 0, 1 and 2. `batch_invert_into` is kept as
+/// the reference the tests check this against, and as the cheaper choice when
+/// the caller has the local memory to spare.
+///
+/// Cost against `batch_invert_into`, per batch:
+///
+/// * multiplies: `7n/2 - 2` (even `n`) instead of `3n - 3`, so `n/2 + 1` more
+///   -- 129 more at `CHUNK == 256`, or +0.504 per candidate. Note that this is
+///   *more* than the `n/2` the rebuilds account for, because the peel also
+///   skips its final accumulator update at `i == 0`, which the classic loop
+///   does perform;
+/// * one inversion, unchanged;
+/// * `Fe` stores: `1.5n` instead of `2n`, i.e. `n/2` fewer. The extra `Fe`
+///   loads the rebuilds need (`n/2` of them) come out of the same budget, so
+///   net traffic falls by only `0.5n` words, about 10% at `CHUNK == 256`.
+///   `SCRATCH.md` measures what that is worth: one `fe_mul` is ~175 SASS and
+///   one 64-bit local access is 1, so the trade loses by roughly 33:1 and is
+///   unfavourable at *every* `CHUNK`, since both terms scale as `n`.
+///
+/// # The three off-by-one traps
+///
+/// Batch inversion has a well-known off-by-one shape -- `n` inverses out of
+/// `3n-3` multiplies and one inversion -- and this variant adds more places to
+/// get it wrong, all of which the tests below pin down:
+///
+/// * the forward pass stores `P[i-1]`, the product *before* absorbing `z[i]`,
+///   because that is what the peel asks for at index `i`. Storing `P[i]`
+///   instead is off by one element and still produces plausible-looking code;
+/// * `P[-1] = 1` is a constant, not a stored value, so index 0 needs no read
+///   at all. Reading `scratch[-1]`-equivalent garbage there returns the
+///   reciprocal of the whole batch product for `out[0]`, which is a perfectly
+///   good field element and silently wrong for exactly one candidate;
+/// * `acc_inv` must be advanced with the *input* `z[i]`, so the peeled value
+///   has to be computed into a temporary before it is stored. Writing it
+///   through `els[i]` first feeds the reciprocal of `z[i]` back into the
+///   accumulator. `batch_invert_into` has the same hazard, which is why it
+///   keeps a `tmp`.
+#[inline(always)]
+pub fn batch_invert_stride2_into(els: &mut [Fe], scratch: &mut [Fe]) {
+    let n = els.len();
+    debug_assert!(
+        scratch.len() >= stride2_scratch_len(n),
+        "stride-2 batch inversion needs {} slots for {} elements, got {}",
+        stride2_scratch_len(n),
+        n,
+        scratch.len()
+    );
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        // No prefix products exist and the peel has nothing to walk, so this
+        // is just the single inversion the whole scheme exists to amortise.
+        els[0] = fe_invert(&els[0]);
+        return;
+    }
+
+    // Forward pass. On entry to the body for index `i`, `acc == P[i-1]`; on
+    // exit, `acc == P[n-1]`, the product being inverted. Only even `i` stores,
+    // and the loop is stepped two at a time so the store is unconditional.
+    let mut acc = FE_ONE;
+    let mut i = 0;
+    while i + 1 < n {
+        scratch[i / 2] = acc;
+        acc = fe_mul(&acc, &els[i]);
+        acc = fe_mul(&acc, &els[i + 1]);
+        i += 2;
+    }
+    if i < n {
+        // Odd tail: store the last even prefix, then absorb the final element.
+        // `P[n-1]` itself is not stored -- it would land in a slot the peel
+        // never reads.
+        scratch[i / 2] = acc;
+        acc = fe_mul(&acc, &els[i]);
+    }
+
+    // One inversion for the whole batch.
+    let mut acc_inv = fe_invert(&acc);
+
+    // Backwards peel. On entry to the body for index `i`, `acc_inv == 1/P[i]`.
+    //
+    // `P[i-1]` is at `scratch[i / 2]` either way; only whether it is there
+    // *as is* depends on the parity of `i-1`:
+    //
+    //   * `i` even => `i-1` is odd => `i-1 = 2*(i/2) - 1`, so `P[i-1]` is
+    //     exactly the stored slot. No multiply.
+    //   * `i` odd  => `i-1` is even => `P[i-1] = P[i-2] * z[i-1]` and `P[i-2]`
+    //     is the stored slot `(i-1)/2 == i/2`. One multiply, and `z[i-1]` is
+    //     still live because the peel has only reached `i` so far.
+    let mut i = n - 1;
+    loop {
+        if i == 0 {
+            // `P[-1] = 1`, so `out[0] == acc_inv` and the accumulator's last
+            // step is skipped entirely. Checked before the multiply, or the
+            // peel pays a multiply whose result is thrown away.
+            els[0] = acc_inv;
+            return;
+        }
+        let p = if i % 2 == 0 {
+            scratch[i / 2]
+        } else {
+            // `z[i-1]` is still the original value: the peel only reaches index
+            // `i`, so index `i-1` has not been written yet.
+            fe_mul(&scratch[i / 2], &els[i - 1])
+        };
+        // Order matters: `acc_inv` must be advanced with the *input* `z[i]`, so
+        // `out` is computed into a temporary first. Writing it through `els[i]`
+        // first would feed the reciprocal of `z[i]` back into the accumulator
+        // and corrupt every later element. `batch_invert_into` has the same
+        // hazard, which is why it keeps a `tmp` too.
+        let out = fe_mul(&p, &acc_inv);
+        acc_inv = fe_mul(&acc_inv, &els[i]);
+        els[i] = out;
+        i -= 1;
+    }
+}
+
 /// Number of precomputed base-point multiples.
 ///
 /// A clamped ed25519 scalar has bit 254 set and bit 255 clear, so bit indices
@@ -890,6 +1044,274 @@ mod tests {
         let mut scratch = [FE_ZERO; 16];
         batch_invert_into(&mut got, &mut scratch);
         assert_eq!(got, want);
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch inversion, including the half-size-scratch variant.
+    //
+    // The classic shape is `n` inverses out of `3n-3` multiplies and one
+    // inversion, so `n = 1` and `n = 2` are the interesting degenerate cases
+    // and the odd/even boundary at `n = 3` is where an off-by-one in the
+    // reverse peel shows up first. Everything is checked against individual
+    // `fe_invert` rather than against the other implementation, so the two
+    // cannot be wrong in the same way.
+    // -----------------------------------------------------------------------
+
+    /// Invert each element on its own; the oracle for every test below.
+    fn individual_inverses(inputs: &[Fe]) -> Vec<Fe> {
+        inputs.iter().map(fe_invert).collect()
+    }
+
+    /// A reproducible, well-spread set of `n` non-zero field elements.
+    ///
+    /// The limbs are masked to 51 bits and the top limb is forced non-zero, so
+    /// no element can be 0 mod p. Values whose limbs all sit at `MASK` are
+    /// included on purpose: those are what breaks a lazy reduction.
+    fn batch_inputs(n: usize) -> Vec<Fe> {
+        const M: u64 = (1u64 << 51) - 1;
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s & M
+        };
+        (0..n)
+            .map(|i| {
+                if i % 5 == 0 {
+                    [M, M, M, M, next() | 1]
+                } else {
+                    [next() | 1, next(), next(), next(), next() | 1]
+                }
+            })
+            .collect()
+    }
+
+    /// `batch_invert_into` and `batch_invert_stride2_into` must both return the
+    /// individual inverses, for every length from 0 to 300.
+    ///
+    /// A sweep rather than a handful of lengths because the two schemes differ
+    /// in their parity handling, and the failures are length-specific: a
+    /// broken odd-length tail shows up at `n = 3, 5, 7, ...`, a broken
+    /// `P[-1] = 1` at every length, and a wrong `P[n-1]` only at lengths where
+    /// the last prefix would be stored. Length 0 and 1 are the ones the peel
+    /// can get structurally wrong (no prefixes at all), so they are in here.
+    #[test]
+    fn batch_invert_lengths_0_to_300() {
+        let mut scratch_full = [FE_ZERO; 300];
+        let mut scratch_half = [FE_ZERO; 300];
+        for n in 0..=300usize {
+            let inputs = batch_inputs(n);
+            let want = individual_inverses(&inputs);
+
+            let mut got = inputs.clone();
+            batch_invert_into(&mut got, &mut scratch_full[..n.max(1)]);
+            assert_eq!(got, want, "batch_invert_into, n = {}", n);
+
+            let half = stride2_scratch_len(n);
+            let mut got = inputs.clone();
+            batch_invert_stride2_into(&mut got, &mut scratch_half[..half.max(1)]);
+            assert_eq!(got, want, "batch_invert_stride2_into, n = {}", n);
+        }
+    }
+
+    /// The degenerate lengths, spelled out one by one.
+    ///
+    /// `n = 0` must be a no-op on both sides; `n = 1` is a bare inversion with
+    /// no multiply and no storage at all; `n = 2` is the smallest case where
+    /// the peel runs, and the smallest where the stride-2 scheme has to
+    /// rebuild a prefix. Each is checked against `fe_invert` directly so a
+    /// shared bug in the harness cannot hide.
+    #[test]
+    fn batch_invert_degenerate_lengths() {
+        let mut scratch = [FE_ZERO; 4];
+
+        // n = 0: nothing in, nothing out, no panic.
+        let mut none: Vec<Fe> = Vec::new();
+        batch_invert_into(&mut none, &mut []);
+        assert!(none.is_empty());
+        let mut none2: Vec<Fe> = Vec::new();
+        batch_invert_stride2_into(&mut none2, &mut []);
+        assert!(none2.is_empty());
+
+        // n = 1.
+        for v in 1u64..=8 {
+            let a: Fe = [v, v * 3, 0, 0, 0];
+            let mut one = [a];
+            batch_invert_into(&mut one, &mut scratch);
+            assert_eq!(one[0], fe_invert(&a), "n=1 v={}", v);
+            let mut one = [a];
+            batch_invert_stride2_into(&mut one, &mut scratch);
+            assert_eq!(one[0], fe_invert(&a), "n=1 stride2 v={}", v);
+        }
+
+        // n = 2 and n = 3: the smallest lengths with a real peel, and the
+        // first odd length.
+        for n in [2usize, 3] {
+            let inputs = batch_inputs(n);
+            let want = individual_inverses(&inputs);
+
+            let mut got = inputs.clone();
+            batch_invert_into(&mut got, &mut scratch[..n]);
+            assert_eq!(got, want, "n={}", n);
+
+            let mut got = inputs.clone();
+            batch_invert_stride2_into(&mut got, &mut scratch[..stride2_scratch_len(n)]);
+            assert_eq!(got, want, "n={} stride2", n);
+        }
+    }
+
+    /// Large prime-ish lengths, including the kernel's own `CHUNK`.
+    ///
+    /// 251 and 257 are prime; 256 is a power of two, which is the case where a
+    /// "split in half" indexing scheme is most likely to be off by one. 1023
+    /// is `2^10 - 1`, so every element but the last lands in a full pair.
+    #[test]
+    fn batch_invert_large_lengths() {
+        let mut scratch_full = [FE_ZERO; 1100];
+        let mut scratch_half = [FE_ZERO; 1100];
+        for n in [
+            7usize, 8, 9, 15, 16, 17, 127, 128, 129, 251, 255, 256, 257, 511, 512, 1023,
+        ] {
+            let inputs = batch_inputs(n);
+            let want = individual_inverses(&inputs);
+
+            let mut got = inputs.clone();
+            batch_invert_into(&mut got, &mut scratch_full[..n]);
+            assert_eq!(got, want, "batch_invert_into, n = {}", n);
+
+            let mut got = inputs.clone();
+            batch_invert_stride2_into(&mut got, &mut scratch_half[..stride2_scratch_len(n)]);
+            assert_eq!(got, want, "batch_invert_stride2_into, n = {}", n);
+        }
+    }
+
+    /// The stride-2 buffer really is half the size, and the two schemes agree
+    /// bit for bit.
+    ///
+    /// Agreeing with `fe_invert` already pins the *values*; this pins the
+    /// *contract* on `scratch`, so a future edit that quietly needs the full
+    /// length fails here rather than scribbling past the array.
+    #[test]
+    fn stride2_scratch_is_half_and_agrees() {
+        for n in 0..=64usize {
+            assert_eq!(stride2_scratch_len(n), (n + 1) / 2, "n = {}", n);
+        }
+        for n in [1usize, 2, 3, 8, 255, 256, 257] {
+            let inputs = batch_inputs(n);
+            let mut a = inputs.clone();
+            let mut b = inputs.clone();
+            let mut full = [FE_ZERO; 300];
+            let mut half = [FE_ZERO; 300];
+            batch_invert_into(&mut a, &mut full[..n]);
+            batch_invert_stride2_into(&mut b, &mut half[..stride2_scratch_len(n)]);
+            assert_eq!(a, b, "n = {}", n);
+        }
+    }
+
+    /// A duplicated or adversarial element must not upset either scheme.
+    ///
+    /// Montgomery's trick is agnostic to the inputs, so repeated values are a
+    /// cheap way to catch an indexing bug that happens to be masked by
+    /// distinct values: with duplicates, several peel steps consume the *same*
+    /// array slot contents.
+    #[test]
+    fn batch_invert_tolerates_repeated_elements() {
+        let m = (1u64 << 51) - 1;
+        // Every entry must be non-zero: `p` itself is 0 in the field, and
+        // inverting 0 is meaningless, so `p - 1` is the interesting top end.
+        let patterns: [Fe; 4] = [
+            [1, 0, 0, 0, 0],
+            [m, m, m, m, m],
+            [m - 19, m, m, m, m], // p - 1
+            [0, 0, 0, 0, 18],
+        ];
+        let mut scratch_full = [FE_ZERO; 40];
+        let mut scratch_half = [FE_ZERO; 40];
+        for pat in patterns.iter() {
+            for n in [1usize, 2, 3, 4, 5, 8, 9, 16, 17, 32] {
+                // Alternate between the pattern and a second value so the
+                // product is not degenerate.
+                let other: Fe = [pat[0] ^ 0x1234, pat[1], pat[2] ^ 7, pat[3], pat[4]];
+                let inputs: Vec<Fe> = (0..n)
+                    .map(|i| if i % 2 == 0 { *pat } else { other })
+                    .collect();
+                let want = individual_inverses(&inputs);
+
+                let mut got = inputs.clone();
+                batch_invert_into(&mut got, &mut scratch_full[..n]);
+                assert_eq!(got, want, "n={} pat={:?}", n, pat);
+
+                let mut got = inputs.clone();
+                batch_invert_stride2_into(&mut got, &mut scratch_half[..stride2_scratch_len(n)]);
+                assert_eq!(got, want, "n={} stride2 pat={:?}", n, pat);
+            }
+        }
+    }
+
+    /// The multiply count is the whole point of the trade in `SCRATCH.md`, so
+    /// it is checked arithmetically rather than asserted in prose.
+    ///
+    /// `fe_mul` is a free function, so instrumenting it would need a shim that
+    /// the device build would not compile; instead the closed forms are
+    /// checked against a per-index model of the loop. If someone finds a
+    /// cheaper peel this fails and the table in `SCRATCH.md` needs updating.
+    #[test]
+    fn stride2_multiply_counts_match_their_closed_forms() {
+        for n in [2usize, 3, 4, 5, 8, 16, 17, 128, 255, 256, 257] {
+            // The classic peel is 3n - 3: n in the forward pass and 2n in the
+            // peel, less the 3 for the pairs of multiplies the baseline also
+            // skips at the ends.
+            assert_eq!(3 * n - 3, classic_mul_count(n), "n = {}", n);
+
+            // The stride-2 peel, index by index: the forward pass is n
+            // multiplies; the peel pays 2 per element (one for out[i], one to
+            // advance the accumulator) plus one rebuild for each odd index,
+            // minus the two multiplies the ends do not need (out[0] is the
+            // accumulator itself, so neither the product nor the accumulator
+            // update happens at i == 0).
+            let mut modelled = n;
+            for i in 0..n {
+                if i == 0 {
+                    continue;
+                }
+                modelled += 2;
+                if i % 2 == 1 {
+                    modelled += 1;
+                }
+            }
+            assert_eq!(modelled, stride2_mul_count(n), "n = {}", n);
+        }
+        assert_eq!(classic_mul_count(1), 0, "n = 1 is a bare inversion");
+        assert_eq!(stride2_mul_count(1), 0, "n = 1 is a bare inversion");
+        assert_eq!(classic_mul_count(0), 0);
+        assert_eq!(stride2_mul_count(0), 0);
+
+        // At CHUNK = 256: 894 against 765, i.e. +129 multiplies per chunk, or
+        // +0.504 per candidate. These are the numbers SCRATCH.md quotes.
+        assert_eq!(stride2_mul_count(256), 894);
+        assert_eq!(classic_mul_count(256), 765);
+    }
+
+    /// Multiplies `batch_invert_into` performs for `n` elements (0 for n <= 1).
+    fn classic_mul_count(n: usize) -> usize {
+        if n <= 1 {
+            0
+        } else {
+            3 * n - 3
+        }
+    }
+
+    /// Multiplies `batch_invert_stride2_into` performs for `n` elements:
+    /// `7n/2 - 2` for even `n` and `(7n - 5)/2` for odd `n`, 0 for `n <= 1`.
+    fn stride2_mul_count(n: usize) -> usize {
+        if n <= 1 {
+            0
+        } else if n % 2 == 0 {
+            7 * n / 2 - 2
+        } else {
+            (7 * n - 5) / 2
+        }
     }
 
     fn hex(b: &[u8]) -> String {

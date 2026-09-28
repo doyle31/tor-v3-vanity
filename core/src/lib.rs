@@ -23,16 +23,56 @@ pub mod sha512;
 use rustacuda_core::DevicePointer;
 use rustacuda_derive::DeviceCopy;
 
-/// Threads per block. Each thread runs an independent batch of candidates.
-pub const BLOCK: usize = 256;
+// Compile-time tunables.
+//
+// These size local arrays (`zs`, `scratch` in the kernel) and drive loop
+// unrolling, so they must be constants: a runtime value would put the chunk
+// buffers in local memory and cost far more than it saves. They are therefore
+// overridable at *build* time via environment variables, which is what makes
+// sweeping them practical -- `T3V_CHUNK=4 cargo build --release`.
+//
+// Getting these wrong is expensive in a specific way: the kernel sat at 255
+// registers/thread, which is the hardware ceiling, leaving room for only 8
+// warps per SM against the 48 an SM can hold. The chunk buffers are a large
+// part of that, so CHUNK and MAXHITS have to be chosen together and measured.
+
+/// Threads per block. Only an upper bound: the host picks the real value from
+/// the kernel's register usage (see `--threads`).
+pub const BLOCK: usize = match option_env!("T3V_BLOCK") {
+    Some(s) => parse_usize(s.as_bytes()),
+    None => 256,
+};
 
 /// Candidates examined per chunk. A chunk is batch-inverted together, so this
 /// is also the inversion amortisation factor.
-pub const CHUNK: usize = 8;
+pub const CHUNK: usize = match option_env!("T3V_CHUNK") {
+    Some(s) => parse_usize(s.as_bytes()),
+    None => 8,
+};
 
 /// Candidates examined per thread per launch. Must be a multiple of `CHUNK`
 /// so that every chunk is full.
-pub const BATCH: usize = 64;
+pub const BATCH: usize = match option_env!("T3V_BATCH") {
+    Some(s) => parse_usize(s.as_bytes()),
+    None => 64,
+};
+
+/// Minimal compile-time `usize` parser: only leading decimal digits, no sign or
+/// whitespace, so a typo in an env var yields 0 (and trips the assertions in
+/// `render`) rather than a silent nonsense value.
+const fn parse_usize(bytes: &[u8]) -> usize {
+    let mut out: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < b'0' || c > b'9' {
+            break;
+        }
+        out = out * 10 + (c - b'0') as usize;
+        i += 1;
+    }
+    out
+}
 
 // The batching logic compiles for the host too, so it can be unit tested
 // against RFC 8032 vectors; only the entry point needs the GPU intrinsics.

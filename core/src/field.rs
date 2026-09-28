@@ -55,24 +55,47 @@ pub const FE_D2: Fe = D2;
 pub const FE_D: Fe = D;
 pub const FE_SQRT_M1: Fe = SQRT_M1;
 
-/// Propagate carries so every limb is < 2^51, folding the top overflow back
-/// into limb 0 via 2^255 == 19 (mod p).
+/// Propagate carries so **every** limb is < 2^51, folding the top overflow
+/// back into limb 0 via 2^255 == 19 (mod p).
 ///
 /// Tolerates input limbs up to ~2^64: each step is `r[i] >> 51`, mask, and
 /// add the carry to the next limb, so a limb several orders of magnitude over
-/// still resolves in a single pass. The `* 19` fold at the end is small
-/// enough (< 2^18) that limb 0 cannot overflow from it.
+/// still resolves in a single pass.
+///
+/// The 19-fold lands in limb 0 *after* limb 0 has been masked, so limb 0 can
+/// come out of a pass still carrying, and limbs above it can then each pick up
+/// a carry of their own. `fe_reduce`'s subtraction needs every limb to be a
+/// true radix digit, so the pass repeats until limb 0 settles. Each repeat
+/// folds another multiple of p out of the value, so it terminates; in practice
+/// the second pass is the last.
+///
+/// (A single pass leaves limb 0 up to 2^18 over and limb 2 at 2^51, which is
+/// how `fe_invert(2)` used to come out as [0x1000, 0x1fff, 0x1fff, 0, 0].)
 #[inline(always)]
 fn carry(mut r: [u64; 5]) -> Fe {
-    for i in 0..4 {
-        let c = r[i] >> 51;
-        r[i] &= MASK;
-        r[i + 1] += c;
+    loop {
+        let mut c;
+        c = r[0] >> 51;
+        r[0] &= MASK;
+        r[1] += c;
+        c = r[1] >> 51;
+        r[1] &= MASK;
+        r[2] += c;
+        c = r[2] >> 51;
+        r[2] &= MASK;
+        r[3] += c;
+        c = r[3] >> 51;
+        r[3] &= MASK;
+        r[4] += c;
+        c = r[4] >> 51;
+        r[4] &= MASK;
+        // 2^255 == 19 (mod p). This is the only limb that can still be
+        // carrying on exit, so it is the only thing the loop has to test.
+        r[0] += c * 19;
+        if r[0] < (1u64 << 51) {
+            return r;
+        }
     }
-    let c = r[4] >> 51;
-    r[4] &= MASK;
-    r[0] += c * 19;
-    r
 }
 
 #[inline(always)]
@@ -103,28 +126,45 @@ fn fe_reduce(a: &Fe) -> Fe {
         (1u64 << 51) - 1,
     ];
 
-    // Compute a - p and select it when a >= p. The comparison is done
-    // high-limb-first so an earlier difference decides the outcome.
-    let mut ge = 1u64; // "all higher limbs were equal"
-    for i in (0..5).rev() {
-        let lt = (a[i] < P[i]) as u64;
-        ge = (ge & (1 ^ lt)) | ((1 ^ ge) & (fe_limb_eq(a[i], P[i])));
+    // Subtract p as a borrow chain rather than comparing limb-by-limb.
+    //
+    // The borrow out of the top limb is 1 exactly when a < p, so the mask
+    // selects a - p when a >= p and leaves a alone otherwise. Two things make
+    // this the only correct shape:
+    //
+    //  * `a` must be a true digit vector first. It is not one: fe_mul's carry
+    //    chain leaves limb 2 at 2^51, and a borrow chain over non-normalised
+    //    digits computes the wrong difference (it is how fe_invert(2) came out
+    //    as [0x1000, 0x1fff, 0x1fff, 0, 0] instead of 2). carry() guarantees
+    //    that now.
+    //  * A limb-by-limb `>=` scan cannot tell "already greater" from "still
+    //    equal", so it resurrected `a >= p` whenever a lower limb happened to
+    //    equal p's after a higher limb had already decided `a < p`. A carried
+    //    limb lands on 2^51-1 often enough for that to be reachable, and it
+    //    is how fe_invert(2), fe_invert(4), fe_invert(8), fe_invert(16),
+    //    fe_invert(32) and fe_invert(38) all came out wrong. See
+    //    `invert_of_small_values_is_exact`.
+    //
+    // The chain is also a little cheaper than the scan it replaces: two
+    // overflowing_sub per limb instead of a compare plus an equality test.
+    let n = carry(*a);
+    let mut diff = [0u64; 5];
+    let mut borrow = 0u64;
+    for i in 0..5 {
+        let (d, b1) = n[i].overflowing_sub(P[i]);
+        let (d, b2) = d.overflowing_sub(borrow);
+        diff[i] = d;
+        borrow = (b1 | b2) as u64;
     }
 
-    let mask = 0u64.wrapping_sub(ge);
+    // borrow == 0 means n >= p, so keep the difference. n - p < 2^51 by
+    // construction (n < 2^255 and p = 2^255 - 19), so no carry is needed after.
+    let mask = 0u64.wrapping_sub(1 ^ borrow);
     let mut r = [0u64; 5];
     for i in 0..5 {
-        // a[i] - P[i] is non-negative whenever ge == 1, and we only use the
-        // result in that case, so the wrapping is benign.
-        r[i] = a[i].wrapping_sub(P[i] & mask);
+        r[i] = n[i] ^ (mask & (n[i] ^ diff[i]));
     }
-    carry(r)
-}
-
-#[inline(always)]
-fn fe_limb_eq(x: u64, y: u64) -> u64 {
-    let d = x ^ y;
-    ((d | d.wrapping_neg()) >> 63) ^ 1
+    r
 }
 
 #[inline(always)]
@@ -504,6 +544,47 @@ mod tests {
         let a: Fe = [3, 5, 7, 11, 13];
         let ai = fe_invert(&a);
         assert_eq!(fe_mul(&a, &ai), FE_ONE);
+    }
+
+    /// `fe_invert` must be exact for *every* input, not just the ones with
+    /// comfortable limb values. This is the test that caught the `fe_reduce`
+    /// comparison bug: the 265-step addition chain visits intermediate values
+    /// whose carried limbs land exactly on 2^51-1, which the old limb-by-limb
+    /// `>=` scan mis-handled. Small inputs are the cheapest way in, because
+    /// their chains stay in a narrow range for long.
+    #[test]
+    fn invert_of_small_values_is_exact() {
+        for v in 1u64..=64 {
+            let a: Fe = [v, 0, 0, 0, 0];
+            let ai = fe_invert(&a);
+            assert_eq!(fe_mul(&a, &ai), FE_ONE, "{}^-1 * {} must be 1", v, v);
+            // And the double inverse, which also pins the limb vector.
+            assert_eq!(fe_invert(&ai), a, "{}^-1 must invert back", v);
+        }
+    }
+
+    /// The same trap for the shapes the kernel actually feeds the inversion:
+    /// points with a maximal top limb, and values just below p.
+    #[test]
+    fn invert_handles_awkward_limbs() {
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for i in 0..2000 {
+            // Half the cases pin limb 4 to 2^51-1, the value the old
+            // comparison keyed on.
+            let a: Fe = if i % 2 == 0 {
+                [next() & MASK, next() & MASK, next() & MASK, next() & MASK, MASK]
+            } else {
+                [next() & MASK, next() & MASK, next() & MASK, next() & MASK, next() & MASK]
+            };
+            let ai = fe_invert(&a);
+            assert_eq!(fe_mul(&a, &ai), FE_ONE, "case {}", i);
+        }
     }
 
     #[test]

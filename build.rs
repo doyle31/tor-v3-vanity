@@ -20,6 +20,12 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=T3V_PTX_PROFILE");
     println!("cargo:rerun-if-env-changed=T3V_PTX_RUSTFLAGS");
+    // The device crate reads these with `option_env!`, so the nested cargo
+    // rebuilds the kernel when they change -- but only if this script re-runs
+    // too. Without these lines the sweep silently measures the previous build.
+    for tunables in ["T3V_BLOCK", "T3V_CHUNK", "T3V_BATCH"] {
+        println!("cargo:rerun-if-env-changed={tunables}");
+    }
 
     link_cuda();
     let ptx = build_kernel()?;

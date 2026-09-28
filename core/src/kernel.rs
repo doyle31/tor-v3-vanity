@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::field::Fe;
 use super::group::{ge_add, ge_base, ge_double, ge_to_bytes_with_zi, scalarmult_base_table, Ge};
 use super::sha512::sha512;
-use super::{BytePrefix, KernelParams, SLOT_BYTES, SLOTS};
+use super::{KernelParams, SLOT_BYTES, SLOTS};
 
 // Used only by the `render` entry point, which is device-only.
 #[cfg(target_arch = "nvptx64")]
@@ -58,10 +58,6 @@ use super::field::{fe_invert, fe_mul, fe_sub, FE_ONE};
 use super::group::{batch_invert_into, TABLE_LEN};
 #[cfg(target_arch = "nvptx64")]
 use super::{BATCH, BLOCK, CHUNK};
-
-/// Most matches a single thread will buffer. Matches are rare (roughly one
-/// per 2^(5*prefix_len)), so this only guards against pathological filters.
-const MAX_HITS: usize = 8;
 
 /// A match found during a batch.
 #[derive(Copy, Clone)]
@@ -73,6 +69,12 @@ pub struct Hit {
 }
 
 /// Per-thread working state, held in registers across a batch.
+///
+/// Note there is no local match buffer. There used to be `hits: [Hit; 8]`,
+/// which cost 8 * 96 bytes = 192 registers per thread and pushed the kernel to
+/// 248 registers -- the hardware ceiling -- leaving room for only 8 warps per
+/// SM, about 17% of the 48 an SM can hold. Matches now go straight into the
+/// shared capture ring, so the buffer has nothing left to do.
 pub struct BatchState {
     /// The walking point: candidate `i` is `cur = [h + 8i]B`.
     cur: Ge,
@@ -82,9 +84,6 @@ pub struct BatchState {
     expanded: [u8; 64],
     /// Candidate counter.
     index: usize,
-    /// Buffered matches.
-    hits: [Hit; MAX_HITS],
-    n_hits: usize,
 }
 
 impl BatchState {
@@ -104,14 +103,6 @@ impl BatchState {
             },
             expanded: [0; 64],
             index: 0,
-            hits: [
-                Hit {
-                    expanded: [0; 64],
-                    pubkey: [0; 32],
-                };
-                MAX_HITS
-            ],
-            n_hits: 0,
         }
     }
 
@@ -131,7 +122,6 @@ impl BatchState {
         self.cur = scalarmult_base_table(&scalar, table);
         self.eight = make_eight();
         self.index = 0;
-        self.n_hits = 0;
     }
 
     /// Advance to the next candidate: one point addition, 8 scalar steps.
@@ -144,57 +134,41 @@ impl BatchState {
         add_clamped_scalar(&mut self.expanded[..32], 8);
     }
 
-    /// Record a match if the compressed pubkey satisfies any prefix.
-    pub fn check(&mut self, params: &KernelParams, z_inv: &Fe) {
-        if self.n_hits >= MAX_HITS {
+    /// Publish a match straight into the prefix's capture ring.
+    ///
+    /// The slot index is claimed with a device-scope atomic, so threads that
+    /// match the same prefix in the same launch each take a distinct slot
+    /// instead of overwriting one another. Once the ring is full the excess is
+    /// dropped rather than wrapped, so a captured key is never overwritten by a
+    /// later one; the host reads `count` to see the true total and can tell
+    /// that it captured fewer.
+    ///
+    /// Publishing here rather than buffering and flushing later is what keeps
+    /// `BatchState` small: the old `[Hit; 8]` buffer was 192 registers a thread.
+    pub fn check(&mut self, params: &mut KernelParams, z_inv: &Fe) {
+        if params.byte_prefixes_len == 0 {
             return;
         }
         let pk = ge_to_bytes_with_zi(&self.cur, z_inv);
         for i in 0..params.byte_prefixes_len {
-            let bp = unsafe { &*params.byte_prefixes.as_raw().add(i) };
+            // Mutable: the ring and its cursor are written through it. The
+            // device crate offers no aliasing guarantees, hence the raw pointer.
+            let bp = unsafe { &mut *params.byte_prefixes.as_raw_mut().add(i) };
             if bp.matches(&pk) {
-                self.hits[self.n_hits] = Hit {
-                    expanded: self.expanded,
-                    pubkey: pk,
-                };
-                self.n_hits += 1;
-                return;
-            }
-        }
-    }
-
-    /// Publish buffered matches into each prefix's capture ring.
-    ///
-    /// Writes through raw pointers: the device crate offers no aliasing
-    /// guarantees. The slot index is claimed with a device-scope atomic, so
-    /// threads that match the same prefix in the same launch each take a
-    /// distinct slot instead of overwriting one another.
-    ///
-    /// Once the ring is full the excess is dropped rather than wrapping, so a
-    /// key is never overwritten by a later one. The host reads `count` to see
-    /// how many were found, and can tell that it captured fewer than that.
-    pub fn flush(&mut self, params: &KernelParams) {
-        let base = params.byte_prefixes.as_raw() as *mut BytePrefix;
-        for h in 0..self.n_hits {
-            let hit = self.hits[h];
-            for i in 0..params.byte_prefixes_len {
-                let bp = unsafe { &mut *base.add(i) };
-                if bp.matches(&hit.pubkey) {
-                    unsafe {
-                        // Claim a slot. `count` only ever increases within a
-                        // launch, so every claim gets a distinct index.
-                        let idx = atomic_add(bp.count.as_raw_mut(), 1) as usize;
-                        if idx < SLOTS {
-                            let out = bp.out.as_raw_mut().add(idx * SLOT_BYTES);
-                            for k in 0..SLOT_BYTES {
-                                *out.add(k) = hit.expanded[k];
-                            }
+                unsafe {
+                    // Claim a slot. `count` only ever increases within a
+                    // launch, so every claim gets a distinct index.
+                    let idx = atomic_add(bp.count.as_raw_mut(), 1) as usize;
+                    if idx < SLOTS {
+                        let out = bp.out.as_raw_mut().add(idx * SLOT_BYTES);
+                        for k in 0..SLOT_BYTES {
+                            *out.add(k) = self.expanded[k];
                         }
                     }
                 }
+                return;
             }
         }
-        self.n_hits = 0;
     }
 }
 
@@ -248,6 +222,18 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, table_ptr: *con
     let params = unsafe { &mut *params_ptr };
     let table = unsafe { core::slice::from_raw_parts(table_ptr, TABLE_LEN) };
 
+    // Guard the compile-time tunables. A zero or misordered value would make the
+    // chunk buffers zero-length and the walk silently do nothing, which looks
+    // like a mysteriously slow kernel rather than a bad setting.
+    assert!(CHUNK > 0, "T3V_CHUNK must be greater than zero");
+    assert!(BATCH > 0, "T3V_BATCH must be greater than zero");
+    assert!(
+        BATCH % CHUNK == 0,
+        "T3V_BATCH ({}) must be a multiple of T3V_CHUNK ({})",
+        BATCH,
+        CHUNK
+    );
+
     let tid = unsafe { _block_dim_x() } * unsafe { _block_idx_x() } + unsafe { _thread_idx_x() };
     let tid = tid as u64;
 
@@ -260,6 +246,19 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, table_ptr: *con
 
     let mut state = BatchState::new();
     state.begin(&seed, table);
+
+    // With no prefixes there is nothing to match, so skip matching entirely:
+    // no compression, no batch inversion, no second pass. This is what
+    // `--bench` uses to measure pure key generation, and it is why that number
+    // is an upper bound on search throughput rather than the search rate.
+    if params.byte_prefixes_len == 0 {
+        for _ in 0..(BATCH / CHUNK) {
+            for _ in 0..CHUNK {
+                state.advance();
+            }
+        }
+        return;
+    }
 
     // Walk in chunks, batch-inverting each chunk's Z coordinates so one
     // inversion serves CHUNK points.
@@ -293,12 +292,11 @@ pub extern "ptx-kernel" fn render(params_ptr: *mut KernelParams, table_ptr: *con
         // candidate of this one, and the next chunk would re-test it.
         state.cur = start;
         for c in 0..CHUNK {
-            state.check(params, &zs[c]);
+            state.check(&mut *params, &zs[c]);
             state.advance();
         }
     }
 
-    state.flush(params);
 }
 
 /// Add a 64-bit delta to a 32-byte little-endian integer, without clamping.

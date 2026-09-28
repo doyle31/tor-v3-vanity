@@ -80,6 +80,46 @@ fn to_chrono(secs: f64) -> chrono::Duration {
         .unwrap_or_else(|_| chrono::Duration::max_value())
 }
 
+/// Reject bad build-time tunables here, on the main thread, with a message
+/// that names the variable.
+///
+/// The device crate asserts the same conditions, but it runs inside a worker
+/// thread: a failure there panicked that thread, `main` then died with an
+/// unrelated `RecvError`, and the actual cause was buried. Worse, the user had
+/// no way to tell which of several `T3V_*` variables was at fault.
+fn validate_tunables() {
+    let mut bad = |name: &str, value: usize, ok: bool, want: &str| {
+        if !ok {
+            eprintln!(
+                "error: {} is {}, but {}. Rebuild without that variable, or set it to {}.",
+                name, value, want, name
+            );
+            std::process::exit(2);
+        }
+    };
+    bad(
+        "T3V_CHUNK",
+        core::CHUNK,
+        core::CHUNK > 0 && core::BATCH % core::CHUNK == 0,
+        "it must be non-zero and divide T3V_BATCH",
+    );
+    bad(
+        "T3V_BATCH",
+        core::BATCH,
+        core::BATCH > 0 && core::BATCH % core::CHUNK == 0,
+        "it must be non-zero and be a multiple of T3V_CHUNK",
+    );
+    // `build_comb_table` requires 2..=4. 5 is the dangerous one: 252 % 5 == 2,
+    // so a 5-bit window silently leaves the top two scalar bits unread, and
+    // clamping sets one of them on every key.
+    bad(
+        "T3V_COMB_W",
+        core::group::COMB_W,
+        (2..=4).contains(&core::group::COMB_W) && core::group::COMB_BITS % core::group::COMB_W == 0,
+        "it must be 2, 3 or 4, and must divide 252",
+    );
+}
+
 fn main() {
     let opts = cli::parse();
     // Install before anything can block, so a signal during startup is still
@@ -88,6 +128,7 @@ fn main() {
     if let Err(e) = signal::install() {
         eprintln!("warning: cannot install signal handlers: {}", e);
     }
+    validate_tunables();
     let launch = gpu::Launch {
         verbose: opts.verbose,
         threads: opts.threads,

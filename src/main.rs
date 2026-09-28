@@ -17,6 +17,7 @@ pub mod bench;
 pub mod cli;
 pub mod gpu;
 pub mod output;
+pub mod signal;
 
 use cli::Mode;
 
@@ -81,6 +82,12 @@ fn to_chrono(secs: f64) -> chrono::Duration {
 
 fn main() {
     let opts = cli::parse();
+    // Install before anything can block, so a signal during startup is still
+    // noticed. Failure is not fatal: a search without it still works, it just
+    // will not close its output file cleanly.
+    if let Err(e) = signal::install() {
+        eprintln!("warning: cannot install signal handlers: {}", e);
+    }
     let launch = gpu::Launch {
         verbose: opts.verbose,
         threads: opts.threads,
@@ -135,7 +142,11 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
 
     let (send, recv) = crossbeam_channel::unbounded();
     let (send_tries, recv_tries) = crossbeam_channel::bounded(1);
-    let dropped_keys = gpu::start(prefixes, send, send_tries, None, launch).unwrap();
+    // A shutdown request has to reach the GPU threads, so they get the stop flag
+    // and this loop watches the signal flag.
+    let stop = signal::stopper();
+    let dropped_keys =
+        gpu::start(prefixes, send, send_tries, Some(stop.clone()), launch).unwrap();
 
     let log_interval = opts.log_interval;
     std::thread::spawn(move || {
@@ -173,9 +184,22 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
     });
 
     loop {
+        // Check the signal on *every* iteration, not only when the channel is
+        // idle. A busy search delivers matches faster than they can be drained,
+        // so `recv_timeout` never fires and a check that lives on the timeout
+        // path alone is never reached -- the process then ignores SIGTERM
+        // entirely. Polling is still needed so a signal is noticed while idle.
+        if signal::requested().load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         // The kernel returns the 64-byte expanded key, so the pubkey comes
         // straight from it with no host-side key derivation.
-        let expanded = recv.recv().unwrap();
+        let expanded = match recv.recv_timeout(Duration::from_millis(200)) {
+            Ok(k) => k,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            // Every search thread is gone; nothing more can arrive.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         let esk = ed25519_dalek::ExpandedSecretKey::from_bytes(&expanded[..]).unwrap();
         let pk: ed25519_dalek::PublicKey = (&esk).into();
         let onion = pubkey_to_onion(pk.as_bytes());
@@ -196,5 +220,16 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             matched,
         })
         .unwrap();
+    }
+
+    // Shut down cleanly. Stopping the GPU threads first stops new keys arriving
+    // while the sink is being closed.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    // `finish` is what closes a `.json` array with its `]`; without it such a
+    // file is unparseable, and every other format is left with a torn last
+    // record. It is also safe to call for CSV and JSON Lines, where it is just
+    // a flush.
+    if let Err(e) = sink.finish() {
+        eprintln!("error closing output: {}", e);
     }
 }

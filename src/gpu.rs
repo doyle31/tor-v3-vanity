@@ -47,7 +47,16 @@ impl BytePrefixOwned {
         .expect("prefix must be base32");
         let mut last_byte_idx = 5 * s.len() / 8 - 1;
         let n_bits = (5 * s.len()) % 8;
-        let last_byte_mask = ((1 << n_bits) - 1) << (8 - n_bits);
+        // When 5*len is a whole number of bytes (len 8, 16, ...) the last byte is
+        // used in full, so the mask must select all 8 of its bits. Leaving it
+        // zero degenerates the comparison to `0 == slice[i]`, which holds for
+        // almost no real prefix -- so an 8-character prefix matched nothing,
+        // ever, and a search for one would run forever finding no keys.
+        let last_byte_mask = if n_bits == 0 {
+            0xFF
+        } else {
+            ((1 << n_bits) - 1) << (8 - n_bits)
+        };
         if last_byte_mask > 0 {
             last_byte_idx += 1;
         }
@@ -353,4 +362,139 @@ fn report_geometry(
         fn_local_bytes,
         if matching { "on" } else { "OFF" }
     );
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    //! The prefix comparison is the one piece of host-side logic with no
+    //! independent oracle, and it was silently wrong for 8-character prefixes.
+    //!
+    //! `5*len` is a whole number of bytes when `len` is a multiple of 8, so the
+    //! partial-byte mask came out as zero and the comparison collapsed to
+    //! `0 == slice[4]`. Almost no prefix satisfies that, so an 8-character
+    //! search found nothing, ever -- and a user waiting for a 2^40 search would
+    //! never know why. The mask is now 0xFF in that case, and these tests
+    //! exercise every length against the real base32 encoding.
+
+    /// Reproduce the host-side comparison from `BytePrefixOwned::from_str`.
+    fn compare(prefix: &str, data: &[u8; 32]) -> bool {
+        let padded = format!("{}aa", prefix);
+        let byte_prefix = base32::decode(
+            base32::Alphabet::RFC4648 { padding: false },
+            &padded,
+        )
+        .expect("base32");
+        let mut last_byte_idx = 5 * prefix.len() / 8 - 1;
+        let n_bits = (5 * prefix.len()) % 8;
+        let last_byte_mask = if n_bits == 0 {
+            0xFF
+        } else {
+            ((1 << n_bits) - 1) << (8 - n_bits)
+        };
+        if last_byte_mask > 0 {
+            last_byte_idx += 1;
+        }
+        data.starts_with(&byte_prefix[..last_byte_idx])
+            && data[last_byte_idx] & last_byte_mask == byte_prefix[last_byte_idx]
+    }
+
+    /// The bytes a prefix should match, as a pubkey would present them.
+    fn expected_bytes(prefix: &str) -> [u8; 32] {
+        let padded = format!("{}aa", prefix);
+        let decoded = base32::decode(
+            base32::Alphabet::RFC4648 { padding: false },
+            &padded,
+        )
+        .expect("base32");
+        let mut out = [0u8; 32];
+        out[..decoded.len()].copy_from_slice(&decoded);
+        out
+    }
+
+    #[test]
+    fn every_prefix_length_matches_its_own_bytes() {
+        // The regression: 8 characters used to fail right here.
+        for len in 1..=12usize {
+            for filler in ["a", "z", "7", "m", "q"] {
+                let prefix: String = filler.repeat(len);
+                assert!(
+                    compare(&prefix, &expected_bytes(&prefix)),
+                    "prefix {:?} (len {}) should match its own bytes",
+                    prefix,
+                    len
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_prefix_rejects_bytes_that_differ_within_the_masked_range() {
+        // Guards the opposite failure: a test that passes by matching
+        // everything. Only bits the comparison actually inspects may be
+        // flipped -- for a 1-character prefix that is 5 bits of byte 0, so
+        // perturbing byte 1 is *correctly* ignored.
+        for len in 1..=12usize {
+            let prefix = "a".repeat(len);
+            let want = expected_bytes(&prefix);
+            let n_bits = (5 * len) % 8;
+            let mask: u8 = if n_bits == 0 {
+                0xFF
+            } else {
+                ((1 << n_bits) - 1) << (8 - n_bits)
+            };
+            let last_idx = if mask != 0 {
+                5 * len / 8
+            } else {
+                5 * len / 8 - 1
+            };
+            for byte in 0..=last_idx {
+                // Bytes before the last are compared in full; the last only
+                // through its mask.
+                let bits = if byte == last_idx { mask } else { 0xFF };
+                for bit in 0..8u8 {
+                    if bits & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let mut other = want;
+                    other[byte] ^= 1 << bit;
+                    assert!(
+                        !compare(&prefix, &other),
+                        "prefix {:?} must reject bit {} of byte {} flipped",
+                        prefix,
+                        bit,
+                        byte
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eight_character_prefixes_are_distinguishable() {
+        // The specific case that was broken, spelled out so the failure is
+        // legible in the log rather than hidden inside a loop over lengths.
+        let a = "a".repeat(8);
+        let b = "b".repeat(8);
+        assert!(compare(&a, &expected_bytes(&a)), "8 x 'a' must match itself");
+        assert!(compare(&b, &expected_bytes(&b)), "8 x 'b' must match itself");
+        assert!(!compare(&a, &expected_bytes(&b)), "8 x 'a' must reject 8 x 'b'");
+    }
+
+    #[test]
+    fn mask_is_full_width_exactly_when_the_prefix_is_a_whole_number_of_bytes() {
+        for len in 1..=12usize {
+            let n_bits = (5 * len) % 8;
+            let mask: u8 = if n_bits == 0 {
+                0xFF
+            } else {
+                ((1 << n_bits) - 1) << (8 - n_bits)
+            };
+            if n_bits == 0 {
+                assert_eq!(mask, 0xFF, "len {} uses whole bytes", len);
+            } else {
+                let used = mask.count_ones();
+                assert_eq!(used as u32, n_bits as u32, "len {}", len);
+            }
+        }
+    }
 }

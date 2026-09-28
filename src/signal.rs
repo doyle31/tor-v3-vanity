@@ -17,7 +17,6 @@ use std::sync::Arc;
 /// Set by the signal handler, polled by the main loop.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
-/// A token the main loop can poll to see whether a shutdown was requested.
 pub fn requested() -> &'static AtomicBool {
     &SIGNALLED
 }

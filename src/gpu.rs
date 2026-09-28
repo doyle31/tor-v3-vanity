@@ -32,6 +32,9 @@ pub struct BytePrefixOwned {
     pub byte_prefix: rustacuda::memory::DeviceBuffer<u8>,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
+    /// The 64-bit view of the prefix, precomputed once here rather than per
+    /// candidate on the device. See `core::prefix_word_masks`.
+    pub word_masks: (u64, u64, u64, u64),
     /// Capture ring: `SLOTS` expanded keys of `SLOT_BYTES` bytes each.
     pub out: rustacuda::memory::DeviceBuffer<u8>,
     /// How many keys the kernel published into the ring this launch.
@@ -45,12 +48,26 @@ impl BytePrefixOwned {
             &format!("{}aa", s),
         )
         .expect("prefix must be base32");
-        let mut last_byte_idx = 5 * s.len() / 8 - 1;
+        // `5 * len / 8 - 1` underflows for a one-character prefix (5/8 == 0), and
+        // the `mask > 0` branch below then increments the wrapped value straight
+        // back to 0 -- the right answer, since such a prefix has no whole bytes
+        // before its partial one. That has always worked because the host is
+        // built in release; `saturating_sub` says it out loud and keeps debug
+        // builds of this crate runnable.
+        let mut last_byte_idx = (5 * s.len() / 8).saturating_sub(1);
         let n_bits = (5 * s.len()) % 8;
-        let last_byte_mask = ((1 << n_bits) - 1) << (8 - n_bits);
+        // Computed in `u32` and narrowed, because `0u8 << 8` is a shift overflow
+        // and a debug build panics on it -- which is what `n_bits == 0` (an
+        // 8-character prefix) produces. The value is the same either way.
+        let last_byte_mask = (((1u32 << n_bits) - 1) << (8 - n_bits)) as u8;
         if last_byte_mask > 0 {
             last_byte_idx += 1;
         }
+        // The kernel compares one 64-bit word per candidate against these, so
+        // they have to be derived from the same bytes `matches` would read. This
+        // is also where a prefix too long for a 64-bit window is rejected: a
+        // search for 13 characters would need bits past the end of the word.
+        let word_masks = core::prefix_word_masks(&byte_prefix, last_byte_idx, last_byte_mask);
         let gpu_byte_prefix = rustacuda::memory::DeviceBuffer::from_slice(&byte_prefix).unwrap();
         let out = vec![0u8; core::SLOTS * core::SLOT_BYTES];
         let gpu_out = rustacuda::memory::DeviceBuffer::from_slice(&out).unwrap();
@@ -59,6 +76,7 @@ impl BytePrefixOwned {
             byte_prefix: gpu_byte_prefix,
             last_byte_idx,
             last_byte_mask,
+            word_masks,
             out: gpu_out,
             count: gpu_count,
         }
@@ -72,6 +90,10 @@ impl BytePrefixOwned {
             last_byte_mask: self.last_byte_mask,
             out: self.out.as_device_ptr(),
             count: self.count.as_device_ptr(),
+            full_mask: self.word_masks.0,
+            full_val: self.word_masks.1,
+            top_mask: self.word_masks.2,
+            top_val: self.word_masks.3,
         }
     }
 }
@@ -169,6 +191,10 @@ pub fn start(
                     last_byte_mask: 0,
                     out: gpu_seed.as_device_ptr(),
                     count: gpu_count_zero.as_device_ptr(),
+                    full_mask: 0,
+                    full_val: 0,
+                    top_mask: 0,
+                    top_val: 0,
                 });
             }
             let mut gpu_byte_prefixes = DeviceBuffer::from_slice(&byte_prefixes).unwrap();

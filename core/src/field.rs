@@ -413,7 +413,50 @@ pub fn fe_is_negative(a: &Fe) -> u64 {
     a[0] & 1
 }
 
-
+/// The low 64 bits of a field element, packed into one `u64`.
+///
+/// # The input must be canonical
+///
+/// This reads limbs, not bits of a residue, so `a` has to be the canonical
+/// representative in `[0, p)` -- which every caller has for free, because
+/// `fe_mul` ends in `fe_reduce` (`mul_output_is_already_canonical` pins that
+/// down). A non-canonical vector is a different integer from its canonical
+/// form: `[MASK; 5]` is `2^255 - 1` as limbs but the value `18`, and its
+/// encoding is `[18, 0, ...]`, not `[0xFF, 0xFF, ...]`.
+///
+/// # Which 64 bits a prefix test can see
+///
+/// The compressed public key is the *little-endian* byte encoding of `y`, but a
+/// Tor v3 address is `base32(pubkey || checksum || 0x03)` in RFC 4648 order,
+/// and RFC 4648 reads a byte string most-significant-bit first. So the
+/// address's **first** character is the top 5 bits of `pubkey[0]` -- the top 5
+/// bits of the *least significant* byte of `y`. A prefix of `L` characters
+/// therefore constrains bits of `y` counted from the **bottom**, and for
+/// `L <= 12` (5L <= 60 bits) the constrained bits never pass bit 63. (The sign
+/// bit, which is output bit 255, is out of reach of every prefix up to 51
+/// characters, so it cannot influence a match.)
+///
+/// Limb 0 holds bits 0..=50 and limb 1 bits 51..=101, so the whole observable
+/// window is two limbs and one OR:
+///
+/// ```text
+///     word = limb0 | (limb1 << 51)
+/// ```
+///
+/// # Why this is not the accumulator `fe_to_bytes` abandoned
+///
+/// `fe_to_bytes` refuses to pack limbs into a `u64` because a *51-bit limb*
+/// shifted left by a *variable* offset (up to 51) overflows `u64` once the
+/// offset exceeds 13, silently dropping the limb's high bits. That hazard is
+/// specific to the variable offset. Here the shift is the constant 51, so the
+/// only bits that can leave the `u64` are bits 101..=127 of the 102-bit limb 1,
+/// which do not exist; the truncation keeps exactly bits 51..=63, which is what
+/// is wanted. `matches_word_is_equivalent_to_matches` in the crate root checks
+/// the result against the byte-wise walk for every prefix length.
+#[inline(always)]
+pub fn fe_prefix_word(a: &Fe) -> u64 {
+    a[0] | (a[1] << 51)
+}
 
 /// Little-endian byte encoding of the canonical representative in [0, p).
 pub fn fe_to_bytes(a: &Fe) -> [u8; 32] {
@@ -756,6 +799,80 @@ mod tests {
         let b = fe_to_bytes(&a);
         let c = fe_from_bytes(&b);
         assert_eq!(a, c);
+    }
+
+    /// `fe_mul` must return the **canonical** representative in [0, p), not
+    /// merely a limb vector congruent to the product.
+    ///
+    /// `ge_prefix_word` reads the low bits of `fe_mul`'s output directly and
+    /// skips the `fe_reduce(&carry())` that `fe_to_bytes` performs, because
+    /// `carry_product` already ends in `fe_reduce`. That is only sound while
+    /// the multiply keeps reducing, and nothing else in the tree would notice
+    /// if it stopped: a product left at, say, `2^255 - 1` still multiplies and
+    /// inverts correctly, and `fe_to_bytes` would silently canonicalise it. So
+    /// the invariant is pinned here, over the same adversarial operand shapes
+    /// the reduction tests use.
+    ///
+    /// Re-reducing a canonical value is the identity, so `fe_reduce(carry(x)) ==
+    /// x` is exactly the claim being made: `x` is already the output of
+    /// `fe_reduce`, hence a proper digit vector standing for a value in [0, p).
+    #[test]
+    fn mul_output_is_already_canonical() {
+        let cases = adversarial();
+        for a in cases.iter() {
+            for b in cases.iter() {
+                let p = fe_mul(a, b);
+                for (i, limb) in p.iter().enumerate() {
+                    assert!(*limb <= MASK, "product limb {} over 2^51: {:?}", i, p);
+                }
+                assert_eq!(fe_reduce(&carry(p)), p, "product is not canonical");
+            }
+        }
+    }
+
+    /// `fe_prefix_word` must be exactly the low 8 bytes of `fe_to_bytes`, read
+    /// little-endian. This is the field-level half of the equivalence the
+    /// crate-root test `matches_word_is_equivalent_to_matches` needs; it is
+    /// checked here against the serial bit walk rather than against itself.
+    ///
+    /// The input is canonicalised first, because that is the contract:
+    /// `fe_prefix_word` reads limbs, not bits of a residue, and a non-canonical
+    /// limb vector (`[MASK; 5]`, say, which is `2^255 - 1`) is a different
+    /// integer from its canonical representative `18` -- reading it directly
+    /// would give the encoding of the *limbs*, not of the value. Every caller
+    /// gets a canonical element for free from `fe_mul`, which is what
+    /// `mul_output_is_already_canonical` pins down.
+    #[test]
+    fn prefix_word_is_the_low_bytes_of_the_encoding() {
+        let mut cases = adversarial();
+        // Plus a sweep, because the adversarial shapes are limb-extremal and
+        // `fe_to_bytes`' walk has data-dependent byte boundaries.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s & MASK
+        };
+        for _ in 0..2000 {
+            cases.push([next(), next(), next(), next(), next()]);
+        }
+        for a in cases.iter() {
+            let bytes = fe_to_bytes(a);
+            let mut want = 0u64;
+            for (i, b) in bytes[..8].iter().enumerate() {
+                want |= (*b as u64) << (8 * i);
+            }
+            let canonical = fe_reduce(&carry(*a));
+            assert_eq!(
+                fe_prefix_word(&canonical),
+                want,
+                "low word of {:?}",
+                bytes
+            );
+            // And the canonical form is a fixed point, so the two agree on it.
+            assert_eq!(fe_reduce(&carry(canonical)), canonical);
+        }
     }
 
     #[test]

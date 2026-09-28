@@ -47,7 +47,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::field::Fe;
-use super::group::{ge_madd, ge_to_bytes_with_zi, scalarmult_base_comb, BaseTables, Ge, Niels};
+use super::group::{ge_madd, ge_prefix_word, scalarmult_base_comb, BaseTables, Ge, Niels};
 use super::sha512::sha512;
 use super::{KernelParams, SLOT_BYTES, SLOTS};
 
@@ -150,16 +150,27 @@ impl BatchState {
     ///
     /// Publishing here rather than buffering and flushing later is what keeps
     /// `BatchState` small: the old `[Hit; 8]` buffer was 192 registers a thread.
+    ///
+    /// # Compression stops at the bits the prefix can see
+    ///
+    /// This used to build the whole 32-byte key with `ge_to_bytes_with_zi` and
+    /// let `BytePrefix::matches` pick a few bytes out of it. That cost two field
+    /// multiplies (one of them, on `x`, provably unable to affect any match --
+    /// it only produces the sign bit at output bit 255) plus a serial 32-step
+    /// bit walk. Now it is one field multiply and a 64-bit word, and the sign
+    /// bit is never computed at all: `ge_prefix_word` returns exactly the low 8
+    /// bytes of the encoding, which is everything a prefix of up to 12
+    /// characters can observe. `matches_word` decides from that word alone.
     pub fn check(&mut self, params: &mut KernelParams, z_inv: &Fe) {
         if params.byte_prefixes_len == 0 {
             return;
         }
-        let pk = ge_to_bytes_with_zi(&self.cur, z_inv);
+        let word = ge_prefix_word(&self.cur, z_inv);
         for i in 0..params.byte_prefixes_len {
             // Mutable: the ring and its cursor are written through it. The
             // device crate offers no aliasing guarantees, hence the raw pointer.
             let bp = unsafe { &mut *params.byte_prefixes.as_raw_mut().add(i) };
-            if bp.matches(&pk) {
+            if bp.matches_word(word) {
                 unsafe {
                     // Claim a slot. `count` only ever increases within a
                     // launch, so every claim gets a distinct index.
@@ -328,7 +339,10 @@ mod tests {
     // `render` is device-only, so its imports are cfg'd to the device build.
     // The tests below exercise the same maths, so pull in the ones they need.
     use crate::field::{fe_invert, FE_ONE};
-    use crate::group::{batch_invert_into, build_power_table, scalarmult_base_table, TABLE_LEN};
+    use crate::group::{
+        batch_invert_into, build_power_table, ge_to_bytes_with_zi, scalarmult_base_table,
+        TABLE_LEN,
+    };
     use crate::{BATCH, CHUNK};
 
     /// The host-built blob the kernel actually receives, plus the power table
@@ -518,5 +532,170 @@ mod tests {
         add_u256(&mut v, 1);
         assert_eq!(v[0], 0);
         assert_eq!(v[1], 1);
+    }
+
+    /// `check` -- the kernel's compress-and-compare step, verbatim -- must
+    /// capture exactly the candidates the old byte-wise path would have
+    /// captured, for every prefix length the tool supports.
+    ///
+    /// This is the end-to-end version of the equivalence argument. It runs the
+    /// real `BatchState::check`, in the real chunked walk shape the kernel uses
+    /// (one batch inversion per chunk, then `check` against each candidate's
+    /// `Z^-1`), with a real `KernelParams` and a real `BytePrefix` pointing at
+    /// host memory. It then asks the byte-wise `BytePrefix::matches` about the
+    /// full 32-byte encoding of the *same* candidates, and compares the two sets
+    /// of captured expanded keys. Comparing sets rather than counts is what
+    /// makes it strong: a false positive and a false negative in the same launch
+    /// would cancel in a count but not in a set.
+    ///
+    /// Three prefix shapes per length, because they exercise different code:
+    ///
+    /// * derived from the walk's own first key, so matches really happen;
+    /// * the same with one compared bit flipped, so the mask is wrong for
+    ///   exactly the candidates that would otherwise match;
+    /// * pseudorandom, so the compare has to reject on the bits themselves.
+    ///
+    /// At 8 characters the host's mask arithmetic degenerates (`5 * 8` is a whole
+    /// number of bytes, so `last_byte_mask` is 0 and the byte-wise test becomes
+    /// `0 == prefix[4]`), which is why the reference path there matches only keys
+    /// whose fifth byte is zero. That is a pre-existing host bug, reproduced
+    /// rather than fixed, and this test compares that shape too.
+    #[test]
+    fn check_captures_exactly_what_the_byte_path_would() {
+        let t = tables();
+        let seed = unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // Candidate 0 of the walk, whose key the first prefix shape is built
+        // from. One inversion, reused for every length.
+        let mut st = BatchState::new();
+        st.begin(&seed, &t.base);
+        let first_key = {
+            let zi = fe_invert(&st.cur.z);
+            ge_to_bytes_with_zi(&st.cur, &zi)
+        };
+
+        let mut zs = [FE_ONE; CHUNK];
+        let mut scratch = [FE_ONE; CHUNK];
+
+        for chars in 1..=12usize {
+            let (last_byte_idx, last_byte_mask) = crate::prefix_shape(chars);
+            for variant in 0..3 {
+                let mut bytes = crate::prefix_bytes_of(&first_key, chars);
+                match variant {
+                    1 => bytes[last_byte_idx] ^= 0x80,
+                    2 => {
+                        for b in bytes.iter_mut() {
+                            *b = next() as u8;
+                        }
+                    }
+                    _ => {}
+                }
+                let (full_mask, full_val, top_mask, top_val) =
+                    crate::prefix_word_masks(&bytes, last_byte_idx, last_byte_mask);
+                // Sized like the real ring, not like the expected match count:
+                // `check` writes a full `SLOTS * SLOT_BYTES` ring before it
+                // knows how many matches there are, so a smaller buffer would be
+                // a heap overflow rather than a test failure.
+                let mut ring = vec![0u8; crate::SLOTS * crate::SLOT_BYTES];
+                let mut count: u32 = 0;
+                let mut prefixes = [crate::BytePrefix {
+                    byte_prefix: unsafe {
+                        rustacuda_core::DevicePointer::wrap(bytes.as_ptr() as *mut u8)
+                    },
+                    byte_prefix_len: crate::prefix_byte_len(chars),
+                    last_byte_idx,
+                    last_byte_mask,
+                    out: unsafe { rustacuda_core::DevicePointer::wrap(ring.as_mut_ptr()) },
+                    count: unsafe { rustacuda_core::DevicePointer::wrap(&mut count) },
+                    full_mask,
+                    full_val,
+                    top_mask,
+                    top_val,
+                }];
+                let mut params = crate::KernelParams {
+                    seed: unsafe { rustacuda_core::DevicePointer::wrap(seed.as_ptr() as *mut u8) },
+                    byte_prefixes: unsafe {
+                        rustacuda_core::DevicePointer::wrap(prefixes.as_mut_ptr())
+                    },
+                    byte_prefixes_len: 1,
+                };
+
+                // The kernel's own walk, chunked exactly as `render` does it.
+                let mut st = BatchState::new();
+                st.begin(&seed, &t.base);
+                let mut want: Vec<[u8; 64]> = Vec::new();
+                for _ in 0..(BATCH / CHUNK) {
+                    let start = st.cur;
+                    zs[0] = start.z;
+                    for c in 1..CHUNK {
+                        let p = ge_madd(&st.cur, &st.eight);
+                        st.cur = p;
+                        zs[c] = p.z;
+                    }
+                    batch_invert_into(&mut zs, &mut scratch);
+
+                    st.cur = start;
+                    for c in 0..CHUNK {
+                        let zi = zs[c];
+                        // The reference verdict, on the same candidate and the
+                        // same `zi` the fast path is about to use.
+                        if prefixes[0].matches(&ge_to_bytes_with_zi(&st.cur, &zi)) {
+                            want.push(st.expanded);
+                        }
+                        st.check(&mut params, &zi);
+                        st.advance();
+                    }
+                }
+
+                assert!(
+                    want.len() <= crate::SLOTS,
+                    "chars {} variant {}: {} matches overflow the ring",
+                    chars,
+                    variant,
+                    want.len()
+                );
+                assert_eq!(
+                    count as usize,
+                    want.len(),
+                    "chars {} variant {}: the kernel captured {} keys, the byte path accepts {}",
+                    chars,
+                    variant,
+                    count,
+                    want.len()
+                );
+                let got: Vec<[u8; 64]> = (0..count as usize)
+                    .map(|i| {
+                        let mut k = [0u8; 64];
+                        k.copy_from_slice(
+                            &ring[i * crate::SLOT_BYTES..(i + 1) * crate::SLOT_BYTES],
+                        );
+                        k
+                    })
+                    .collect();
+                for k in want.iter() {
+                    assert!(
+                        got.iter().any(|g| g == k),
+                        "chars {} variant {}: the byte path matched a key the kernel dropped",
+                        chars,
+                        variant
+                    );
+                }
+                for k in got.iter() {
+                    assert!(
+                        want.iter().any(|w| w == k),
+                        "chars {} variant {}: the kernel captured a key the byte path rejects",
+                        chars,
+                        variant
+                    );
+                }
+            }
+        }
     }
 }

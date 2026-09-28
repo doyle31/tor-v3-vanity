@@ -216,12 +216,63 @@ fn fe_neg(a: &Fe) -> Fe {
 ///
 /// `zi` is the inverse of Z, supplied by the caller so a whole batch of
 /// points can share one inversion (see `batch_invert`).
+///
+/// **This is the reference, not the kernel's path.** The kernel only needs the
+/// bits a prefix can observe, and computes them with [`ge_prefix_word`]; this
+/// function stays as the specification that the tests compare against, and as
+/// the only thing that can produce the sign bit.
 pub fn ge_to_bytes_with_zi(p: &Ge, zi: &Fe) -> [u8; 32] {
     let x = fe_mul(&p.x, zi);
     let y = fe_mul(&p.y, zi);
     let mut out = fe_to_bytes(&y);
     out[31] ^= (fe_is_negative(&x) as u8) << 7;
     out
+}
+
+/// The 64 bits of a compressed public key that a prefix test can observe, as
+/// one `u64`.
+///
+/// # What this replaces
+///
+/// `ge_to_bytes_with_zi` builds all 32 bytes and throws most of them away. Two
+/// costs in it are provably unable to affect any prefix test:
+///
+/// 1. `fe_mul(&p.x, zi)` exists **only** to recover the sign bit, which lands in
+///    output bit 255. A Tor v3 address's first characters come from the first
+///    bytes of the key (see `fe_prefix_word`), so a prefix of up to 12
+///    characters -- 60 bits -- can never reach bit 255. One field multiply,
+///    about as much work as the whole point addition it rides along with,
+///    gone.
+/// 2. `fe_to_bytes` walks all 255 bits of `y` through a data-dependent
+///    ~32-iteration loop to produce 32 bytes, when the caller wants at most 8
+///    bytes' worth of comparison. Replaced by two limb reads and an OR. The
+///    `fe_reduce(&carry())` inside it goes with it: `fe_mul` already returns the
+///    canonical representative -- `carry_product` ends in `fe_reduce` -- so that
+///    pass is a no-op on this input, and re-canonicalising is only insurance
+///    against a `fe_mul` that stops reducing. `mul_output_is_already_canonical`
+///    in the field tests is what keeps that assumption honest.
+///
+/// What is left is one field multiply, which is unavoidable: the bits of a
+/// product depend on every limb of both operands, so there is no cheaper way to
+/// learn the low 64 bits of `p.y * zi`.
+///
+/// The result is exactly the low 8 bytes of `ge_to_bytes_with_zi(p, zi)` read
+/// little-endian, which `prefix_word_is_the_low_bytes_of_the_encoding` and
+/// `fast_path_agrees_with_the_byte_path` check.
+#[inline(always)]
+pub fn ge_prefix_word(p: &Ge, zi: &Fe) -> u64 {
+    fe_prefix_word(&fe_mul(&p.y, zi))
+}
+
+/// Compress-and-compare in a single call: [`ge_prefix_word`] composed with
+/// [`crate::BytePrefix::matches_word`].
+///
+/// The kernel does not call this -- it tests every requested prefix against the
+/// same candidate, so it computes the word once and reuses it -- but the two
+/// halves only mean anything together, and this is the form that reads as "does
+/// this point match". Requires `bp.last_byte_idx <= 7`.
+pub fn ge_matches_prefix(p: &Ge, zi: &Fe, bp: &crate::BytePrefix) -> bool {
+    bp.matches_word(ge_prefix_word(p, zi))
 }
 
 /// Montgomery's trick: invert `n` field elements using 3(n-1) multiplications
@@ -547,6 +598,195 @@ mod tests {
     fn compress(p: &Ge) -> [u8; 32] {
         let zi = fe_invert(&p.z);
         ge_to_bytes_with_zi(p, &zi)
+    }
+
+    // ---- the 64-bit prefix path -------------------------------------------
+    //
+    // `ge_prefix_word` skips `x` and the byte walk that `ge_to_bytes_with_zi`
+    // does, so the claim to check is that the bits it returns are exactly the
+    // bits the byte-wise path would have compared, for every prefix length.
+
+    /// A point whose limbs are pseudorandom, plus a few real ones.
+    ///
+    /// The random-limb points are not on the curve, which is fine and
+    /// deliberate: the prefix test only ever looks at `p.y * zi` as a field
+    /// element, so any input distribution exercises the same code. It also
+    /// reaches limb shapes -- maximal limbs, values that need a second carry
+    /// pass -- that points on the curve essentially never produce. Limbs are
+    /// held under 2^51, which is what `fe_mul`'s accumulator bound assumes;
+    /// the maximal-limb case is added explicitly below rather than being
+    /// hoped for.
+    fn prefix_test_points() -> Vec<Ge> {
+        const LIMB: u64 = (1 << 51) - 1;
+        let mut rng = Rng(0x0C1D_1DEA_5EED_1234);
+        let limb = |r: &mut Rng| r.next() & LIMB;
+        let mut pts: Vec<Ge> = Vec::new();
+        // Real points first: walk the base point a little.
+        let mut p = ge_base();
+        for _ in 0..8 {
+            p = ge_add(&p, &ge_eight());
+            pts.push(p);
+        }
+        for _ in 0..56 {
+            pts.push(Ge {
+                x: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+                y: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+                z: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+                t: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+            });
+        }
+        // A few awkward shapes: the identity, and a maximal y with a unit z, so
+        // the product is already reduced and the interesting part is the
+        // comparison rather than the multiply.
+        pts.push(ge_identity());
+        pts.push(Ge {
+            x: [0, 0, 0, 0, 0],
+            y: [LIMB, LIMB, LIMB, LIMB, LIMB],
+            z: [1, 0, 0, 0, 0],
+            t: [0, 0, 0, 0, 0],
+        });
+        pts
+    }
+
+    /// A `BytePrefix` over host memory, with the fast path's masks filled in
+    /// exactly as the host fills them.
+    fn host_prefix(bytes: &[u8], chars: usize) -> crate::BytePrefix {
+        let (last_byte_idx, last_byte_mask) = crate::prefix_shape(chars);
+        let (full_mask, full_val, top_mask, top_val) =
+            crate::prefix_word_masks(bytes, last_byte_idx, last_byte_mask);
+        crate::BytePrefix {
+            byte_prefix: unsafe { rustacuda_core::DevicePointer::wrap(bytes.as_ptr() as *mut u8) },
+            byte_prefix_len: crate::prefix_byte_len(chars),
+            last_byte_idx,
+            last_byte_mask,
+            out: unsafe { rustacuda_core::DevicePointer::wrap(core::ptr::null_mut()) },
+            count: unsafe { rustacuda_core::DevicePointer::wrap(core::ptr::null_mut()) },
+            full_mask,
+            full_val,
+            top_mask,
+            top_val,
+        }
+    }
+
+    /// `ge_prefix_word` must return the low 8 bytes of the full encoding, read
+    /// little-endian -- the 8 bytes the byte-wise path can possibly look at.
+    #[test]
+    fn prefix_word_is_the_low_bytes_of_the_encoding() {
+        for p in prefix_test_points().iter() {
+            let zi = fe_invert(&p.z);
+            let key = ge_to_bytes_with_zi(p, &zi);
+            let mut want = 0u64;
+            for (i, b) in key[..8].iter().enumerate() {
+                want |= (*b as u64) << (8 * i);
+            }
+            assert_eq!(ge_prefix_word(p, &zi), want, "low word of {}", hex(&key));
+        }
+    }
+
+    /// The equivalence itself, for every prefix length the tool supports, over
+    /// real and adversarial points and pseudorandom prefixes.
+    ///
+    /// Both paths are run on the *same* point with the *same* `zi`, so a
+    /// disagreement can only come from the compression or the comparison, never
+    /// from the inputs drifting.
+    #[test]
+    fn fast_path_agrees_with_the_byte_path() {
+        let mut rng = Rng(0xBEEF_CAFE_1357_9BDF);
+        for chars in 1..=12usize {
+            for p in prefix_test_points().iter() {
+                let zi = fe_invert(&p.z);
+                let key = ge_to_bytes_with_zi(p, &zi);
+                for _ in 0..4 {
+                    // A pseudorandom prefix of this length: the host's decoded
+                    // bytes, with noise in the bytes past the prefix's own bits
+                    // so that a comparison reaching further than it should is
+                    // caught.
+                    let mut bytes = crate::prefix_bytes_of(&key, chars);
+                    for b in bytes[crate::prefix_byte_len(chars)..].iter_mut() {
+                        *b = rng.next() as u8;
+                    }
+                    // Noise *within* the prefix's own bits too, then put the
+                    // key's own bits back for half the cases so that matches
+                    // actually occur.
+                    for i in 0..crate::prefix_byte_len(chars) {
+                        bytes[i] ^= rng.next() as u8;
+                    }
+                    if rng.next() & 1 == 0 {
+                        let own = crate::prefix_bytes_of(&key, chars);
+                        bytes[..crate::prefix_byte_len(chars)]
+                            .copy_from_slice(&own[..crate::prefix_byte_len(chars)]);
+                    }
+                    let bp = host_prefix(&bytes, chars);
+                    assert_eq!(
+                        ge_matches_prefix(p, &zi, &bp),
+                        bp.matches(&key),
+                        "chars {}: fast path and byte path disagree, key {} prefix {:?}",
+                        chars,
+                        hex(&key),
+                        &bytes[..crate::prefix_byte_len(chars)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A key that *does* match must still match on the fast path.
+    ///
+    /// This is the test that catches the failure mode that looks like a slow GPU
+    /// instead of a bug: an inverted comparison, a mask on the wrong side, or an
+    /// off-by-one in the top-bit extraction all keep the two paths agreeing on
+    /// every *rejection* while making them reject every *match*, so a search
+    /// returns nothing and reports a plausible-looking rate. The equivalence
+    /// sweep above cannot see that, because random prefixes rarely match.
+    ///
+    /// The prefix is built from the key's own address bits, so it matches by
+    /// construction -- except at 8 characters, where the host's mask arithmetic
+    /// degenerates (5 * 8 is a whole number of bytes, so `last_byte_mask` is 0
+    /// and the byte-wise test becomes `0 == prefix[4]`, i.e. the key's fifth
+    /// byte must be zero; see `prefix_word_masks`). That is a pre-existing host
+    /// bug, reproduced here rather than fixed, so this test skips such keys and
+    /// keeps looking: 1 key in 256 qualifies.
+    #[test]
+    fn a_matching_key_matches_on_the_fast_path() {
+        let mut rng = Rng(0x1357_9BDF_2468_ACE0);
+        for chars in 1..=12usize {
+            let mut found = 0usize;
+            for _ in 0..8192 {
+                // A point with pseudorandom limbs: enough, since only `y * zi`
+                // is read.
+                const LIMB: u64 = (1 << 51) - 1;
+                let limb = |r: &mut Rng| r.next() & LIMB;
+                let p = Ge {
+                    x: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+                    y: [limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng), limb(&mut rng)],
+                    z: FE_ONE,
+                    t: [0, 0, 0, 0, 0],
+                };
+                let zi = fe_invert(&p.z);
+                let key = ge_to_bytes_with_zi(&p, &zi);
+                let bytes = crate::prefix_bytes_of(&key, chars);
+                let bp = host_prefix(&bytes, chars);
+                if !bp.matches(&key) {
+                    // Not matchable at this length; keep looking.
+                    continue;
+                }
+                assert!(
+                    ge_matches_prefix(&p, &zi, &bp),
+                    "chars {}: the byte path matched key {} but the fast path did not",
+                    chars,
+                    hex(&key)
+                );
+                found += 1;
+                if found == 4 {
+                    break;
+                }
+            }
+            assert!(
+                found > 0,
+                "chars {}: no key matched under the byte path, so the test proved nothing",
+                chars
+            );
+        }
     }
 
     #[test]

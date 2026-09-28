@@ -1,5 +1,18 @@
 # Removing the second walk of each chunk
 
+> **DEPRECATED -- the instruction figures in this document are not trustworthy.**
+>
+> This was written by a subagent against pre-comb code, and its derived
+> per-candidate numbers contradict each other by 4-5x: the pass-1 and pass-2
+> bodies (3,487 + 4,158) sum to 7,645 per candidate, while "whole chunk, 8.53M"
+> implies 33,320, and the gap is charged to batch inversion at a figure ~23x too
+> high. The measured A/B results -- the +34% for removing the second walk, and
+> the SASS deltas for that change specifically -- are direct measurements and
+> stand. The absolute per-candidate costs derived from them do not.
+>
+> Kept for the record of what changed and why. See THROUGHPUT.md for the current
+> state of the throughput numbers.
+
 ## What changed
 
 `render` used to walk every chunk of `CHUNK` candidates twice:

@@ -125,6 +125,15 @@ pub struct BytePrefix {
     pub byte_prefix_len: usize,
     pub last_byte_idx: usize,
     pub last_byte_mask: u8,
+    /// The first eight prefix bytes, packed little-endian.
+    ///
+    /// This is what the kernel actually tests: the low eight bytes of the
+    /// encoding are one 64-bit word, so a prefix costs a masked compare instead
+    /// of a `memcmp` against a byte array in local memory. The host fills it in
+    /// from `byte_prefix`; only bytes `0..=last_byte_idx` are ever read, so the
+    /// bytes past the prefix are zero and the rest of `byte_prefix` is
+    /// redundant on the device.
+    pub prefix_word: u64,
     /// `SLOTS * SLOT_BYTES` bytes: a ring of captured expanded keys.
     pub out: DevicePointer<u8>,
     /// Atomic count of matches published this launch, also the ring cursor.
@@ -132,11 +141,63 @@ pub struct BytePrefix {
 }
 
 impl BytePrefix {
+    /// The longest prefix the kernel can test, in base32 characters.
+    ///
+    /// `L` characters cover `5L` bits, and the host rounds that up to a whole
+    /// number of bytes, so the highest byte it ever compares is
+    /// `(5L + 7) / 8 - 1`. The kernel tests the low *eight* bytes, which
+    /// `L == 12` (60 bits, byte 7) exactly fills. Longer is not a search: a
+    /// 12-character prefix is a 2^60-candidate search, so the host rejects
+    /// anything longer rather than letting it silently never match.
+    pub const MAX_PREFIX_CHARS: usize = 12;
+
     pub fn matches(&self, data: &[u8]) -> bool {
         let slice =
             unsafe { core::slice::from_raw_parts(self.byte_prefix.as_raw(), self.byte_prefix_len) };
         data.starts_with(&slice[..self.last_byte_idx])
             && data[self.last_byte_idx] & self.last_byte_mask == slice[self.last_byte_idx]
+    }
+
+    /// The same predicate as [`matches`](Self::matches), over just the low eight
+    /// bytes of the encoding packed little-endian (see
+    /// `field::fe_to_bytes_low8`).
+    ///
+    /// Byte `i` of the encoding is `(w >> (8 * i)) & 0xFF`, so the test splits
+    /// into a compare of everything below `last_byte_idx` and a masked compare
+    /// of the byte at it. That is `matches` exactly: bytes `0..last_byte_idx`
+    /// must match in full, and `data[last_byte_idx] & last_byte_mask` must equal
+    /// the prefix's byte there. The mask is applied to the data side only, as in
+    /// `matches`, so a prefix byte with junk in the bits the mask clears behaves
+    /// exactly as it did before rather than being quietly accepted.
+    ///
+    /// Returns false for a prefix wider than eight bytes instead of reading past
+    /// the word; the host rejects those (see [`MAX_PREFIX_CHARS`](Self::MAX_PREFIX_CHARS)).
+    #[inline(always)]
+    pub fn matches_low8(&self, w: u64) -> bool {
+        let idx = self.last_byte_idx;
+        if idx >= 8 {
+            return false;
+        }
+        // Bytes 0..idx, and idx itself. `idx < 8`, so the shift is under 64.
+        let low = (1u64 << (8 * idx)) - 1;
+        if (w & low) != (self.prefix_word & low) {
+            return false;
+        }
+        let mask = self.last_byte_mask as u64;
+        (w >> (8 * idx)) & mask == (self.prefix_word >> (8 * idx)) & 0xFF
+    }
+
+    /// Pack the first eight bytes of `prefix` little-endian into a
+    /// `prefix_word`.
+    ///
+    /// Host side. Bytes past the end of `prefix` are zero, which is what
+    /// `matches_low8` needs: it only ever reads bytes `0..=last_byte_idx`.
+    pub fn pack_prefix_word(prefix: &[u8]) -> u64 {
+        let mut w = 0u64;
+        for (i, b) in prefix.iter().take(8).enumerate() {
+            w |= (*b as u64) << (8 * i);
+        }
+        w
     }
 }
 
@@ -164,3 +225,204 @@ pub const POINT_WORDS: usize = 20;
 /// `group::BASE_TABLE_WORDS` instead (see `group::BaseTables`).
 #[cfg(target_arch = "nvptx64")]
 pub const TABLE_WORDS: usize = group::TABLE_LEN * POINT_WORDS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::{fe_to_bytes, fe_to_bytes_low8, Fe};
+    #[allow(unused_imports)]
+    use std::vec::Vec;
+
+    /// A deterministic xorshift, so a failure replays.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn fe(&mut self) -> Fe {
+            let mask = (1u64 << 51) - 1;
+            [
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+            ]
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// The `last_byte_idx` / `last_byte_mask` the host derives from a prefix of
+    /// `l` base32 characters, copied from `BytePrefixOwned::from_str`.
+    ///
+    /// Two details of that derivation matter and are reproduced exactly:
+    /// `5 * l / 8 - 1` underflows for `l == 1` and is only correct because the
+    /// partial-byte correction below adds one straight back (the host ships
+    /// release, so the wrap is invisible), and `n_bits == 0` -- a whole number
+    /// of bytes -- leaves the mask at zero and the index *not* incremented, so
+    /// the final byte is compared in full.
+    fn host_idx_mask(l: usize) -> (usize, u8) {
+        let mut last_byte_idx = (5 * l / 8).wrapping_sub(1);
+        let n_bits = (5 * l) % 8;
+        let last_byte_mask = if n_bits == 0 {
+            0
+        } else {
+            ((1u8 << n_bits) - 1) << (8 - n_bits)
+        };
+        if last_byte_mask > 0 {
+            last_byte_idx += 1;
+        }
+        (last_byte_idx, last_byte_mask)
+    }
+
+    /// A `BytePrefix` over a host-resident prefix buffer, plus the buffer itself.
+    ///
+    /// `DevicePointer` is `#[repr(transparent)]` over a raw pointer and both
+    /// matchers only read through it, so one pointing at host memory exercises
+    /// exactly the code the device runs, with no device involved.
+    fn prefix(bytes: Vec<u8>, l: usize) -> (BytePrefix, Vec<u8>) {
+        let (last_byte_idx, last_byte_mask) = host_idx_mask(l);
+        let bp = BytePrefix {
+            byte_prefix: unsafe { DevicePointer::wrap(bytes.as_ptr() as *mut u8) },
+            byte_prefix_len: bytes.len(),
+            last_byte_idx,
+            last_byte_mask,
+            prefix_word: BytePrefix::pack_prefix_word(&bytes),
+            out: DevicePointer::null(),
+            count: DevicePointer::null(),
+        };
+        (bp, bytes)
+    }
+
+    #[test]
+    fn host_idx_mask_matches_the_host_derivation() {
+        // Pinned against the table worked out by hand, because every
+        // equivalence test below is only as good as this derivation.
+        let want = [
+            (0usize, 0xF8u8), // 1 char,  5 bits:  byte 0, high 5
+            (1, 0xC0),        // 2 chars, 10 bits: byte 0, byte 1 high 2
+            (1, 0xFE),        // 3 chars, 15 bits: byte 0, byte 1 high 7
+            (2, 0xF0),        // 4 chars, 20 bits: bytes 0-1, byte 2 high 4
+            (3, 0x80),        // 5 chars, 25 bits: bytes 0-2, byte 3 high 1
+            (3, 0xFC),        // 6 chars, 30 bits: bytes 0-2, byte 3 high 6
+            (4, 0xE0),        // 7 chars, 35 bits: bytes 0-3, byte 4 high 3
+            (4, 0x00),        // 8 chars, 40 bits: bytes 0-4 in full
+            (5, 0xF8),        // 9 chars, 45 bits: bytes 0-4, byte 5 high 5
+            (6, 0xC0),        // 10 chars, 50 bits: bytes 0-5, byte 6 high 2
+            (6, 0xFE),        // 11 chars, 55 bits: bytes 0-5, byte 6 high 7
+            (7, 0xF0),        // 12 chars, 60 bits: bytes 0-6, byte 7 high 4
+        ];
+        for (l, w) in want.iter().enumerate() {
+            let l = l + 1;
+            assert_eq!(host_idx_mask(l), *w, "{} characters", l);
+            assert!((w.0 as usize) < 8, "{} characters must fit the word", l);
+        }
+        // One past the limit is what the host must reject.
+        assert!(host_idx_mask(13).0 >= 8);
+    }
+
+    #[test]
+    fn matches_low8_agrees_with_matches() {
+        // The property the whole y-only path rests on: testing the low eight
+        // bytes of y in one word is the same predicate as testing the full
+        // 32-byte compressed key byte by byte, for every prefix length the
+        // host can produce.
+        let mut rng = Rng(0x243F_6A88_85A3_08D3);
+        for l in 1..=BytePrefix::MAX_PREFIX_CHARS {
+            // Enough bytes for the comparison plus the two the host's "aa"
+            // padding adds.
+            for _ in 0..200 {
+                let (bp, _buf) = prefix(rng.bytes(5 * l / 8 + 2), l);
+                for _ in 0..8 {
+                    let y = rng.fe();
+                    let mut pk = fe_to_bytes(&y);
+                    let low = fe_to_bytes_low8(&y);
+                    assert_eq!(
+                        bp.matches_low8(low),
+                        bp.matches(&pk),
+                        "l={} y={:?}",
+                        l,
+                        y
+                    );
+                    // The sign bit of x lives in byte 31. Setting it must make
+                    // no difference for any prefix length: that is the whole
+                    // reason the kernel can skip X/Z.
+                    pk[31] ^= 0x80;
+                    assert_eq!(bp.matches_low8(low), bp.matches(&pk), "sign bit, l={}", l);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_low8_is_not_vacuous() {
+        // A matcher that never fires would pass the equivalence test above for
+        // the wrong reason, so pin both directions on real public keys.
+        let mut base: crate::group::BaseTables = unsafe { core::mem::zeroed() };
+        crate::group::build_comb_table(&mut base.comb, &mut base.eight);
+
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&crate::sha512::sha512(&[7u8; 32])[..32]);
+        scalar[0] &= 248;
+        scalar[31] &= 63;
+        scalar[31] |= 64;
+
+        // Two distinct keys: the seed's, and the next one in the walk.
+        let mut next = scalar;
+        crate::kernel::add_clamped_scalar(&mut next, 8);
+
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        let mut lows: Vec<u64> = Vec::new();
+        for s in [scalar, next].iter() {
+            let p = crate::group::scalarmult_base_comb(s, &base.comb);
+            let y = crate::field::fe_mul(&p.y, &crate::field::fe_invert(&p.z));
+            keys.push(crate::group::ge_to_bytes_with_zi(&p, &crate::field::fe_invert(&p.z)));
+            lows.push(fe_to_bytes_low8(&y));
+        }
+        assert_ne!(keys[0], keys[1], "the two walk steps must be different keys");
+
+        for l in 1..=BytePrefix::MAX_PREFIX_CHARS {
+            // The host's prefix bytes: the key's first bytes with the bits the
+            // partial mask clears zeroed, which is exactly what the "aa" the
+            // host appends before base32-decoding does.
+            let (idx, mask) = host_idx_mask(l);
+            let mut bytes = keys[0][..idx + 1].to_vec();
+            bytes[idx] &= mask;
+            let (bp, _buf) = prefix(bytes, l);
+
+            assert!(bp.matches(&keys[0]), "full key, l={}", l);
+            assert!(bp.matches_low8(lows[0]), "low word, l={}", l);
+            assert!(!bp.matches(&keys[1]), "other key must not match, l={}", l);
+            assert!(!bp.matches_low8(lows[1]), "other key, low word, l={}", l);
+        }
+    }
+
+    #[test]
+    fn matches_low8_rejects_a_prefix_wider_than_the_word() {
+        // Unreachable from the host, which rejects prefixes that need more than
+        // eight bytes. It must fail closed rather than shift by 64 or match a
+        // truncated prefix.
+        let (mut bp, _buf) = prefix(vec![0xAAu8; 12], BytePrefix::MAX_PREFIX_CHARS);
+        assert!(!bp.matches_low8(u64::MAX));
+        bp.last_byte_idx = 31;
+        assert!(!bp.matches_low8(u64::MAX));
+        bp.last_byte_idx = 8;
+        assert!(!bp.matches_low8(u64::MAX));
+    }
+
+    #[test]
+    fn prefix_word_is_little_endian() {
+        let w = BytePrefix::pack_prefix_word(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(w, 0x0807_0605_0403_0201);
+        assert_eq!(BytePrefix::pack_prefix_word(&[0xFF]), 0xFF);
+        assert_eq!(BytePrefix::pack_prefix_word(&[]), 0);
+    }
+}
+

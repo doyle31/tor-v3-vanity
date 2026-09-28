@@ -262,9 +262,24 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             // Every search thread is gone; nothing more can arrive.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        let signing_key =
-            ed25519_dalek::SigningKey::from_bytes(&expanded[..32].try_into().unwrap());
-        let pk = ed25519_dalek::VerifyingKey::from(&signing_key);
+        // The kernel hands back an *expanded* key: `expanded[..32]` is already
+        // `clamp(SHA-512(seed)[..32])` and `expanded[32..]` is the nonce prefix.
+        // That is the input `ExpandedSecretKey` wants, not a seed.
+        //
+        // It matters which one is passed. `ExpandedSecretKey::from_bytes`
+        // clamps and reduces the 32 bytes it is given and uses them directly as
+        // the scalar. `SigningKey::from_bytes`, by contrast, treats its argument
+        // as a *seed*: it runs SHA-512 over it first
+        // (`impl From<&SecretKey> for ExpandedSecretKey`) and uses the digest
+        // as the scalar. Feeding an already-expanded key to `SigningKey`
+        // therefore hashes it a second time and derives a public key unrelated
+        // to the one the kernel matched on. Nothing errors -- the wrong address
+        // is computed, fails the prefix check below, and is silently discarded,
+        // so a search finds almost nothing and reports no reason why. On a
+        // 2-character prefix that measured 412 keys in 6s against 418460 for
+        // the correct derivation, the residue being pure coincidence.
+        let esk = ed25519_dalek::hazmat::ExpandedSecretKey::from_bytes(&expanded);
+        let pk = ed25519_dalek::VerifyingKey::from(&esk);
         let onion = pubkey_to_onion(pk.as_bytes());
 
         // Several threads can match the same prefix in one launch, and they all
@@ -301,5 +316,143 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
     // a flush.
     if let Err(e) = sink.finish() {
         eprintln!("error closing output: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod key_derivation_tests {
+    //! The host's public key must be the *same* public key the kernel matched
+    //! on, or every match is discarded at the prefix check and a search reports
+    //! nothing while appearing to run.
+    //!
+    //! This has already gone wrong once. `ed25519-dalek` 1.x took an expanded
+    //! key, but 2.x's `SigningKey::from_bytes` takes a *seed* and SHA-512s it
+    //! first. The obvious-looking migration -- pass the first 32 bytes of the
+    //! expanded key, now called a `SigningKey` -- compiles, runs, and produces a
+    //! different public key for every key, because those bytes are already the
+    //! digest and get hashed again. It is silent: no panic, no error, just a
+    //! search that finds ~1/1024th of what it should.
+    //!
+    //! The check below is end-to-end on purpose. It derives the key exactly the
+    //! way `search` does, then asserts the address the program would print
+    //! against a value derived independently from RFC 8032, and separately
+    //! against what the device crate's own field arithmetic produces. A test
+    //! that only compared two host-side calls would pass under the broken
+    //! migration, since both would be wrong together.
+
+    use super::pubkey_to_onion;
+    use tor_v3_vanity_core as core;
+
+    /// RFC 8032 section 7.1, test vector 1.
+    const SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    const PUBLIC: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+
+    /// The expanded key for a seed: `SHA-512(seed)`, which is what the kernel
+    /// derives and hands back.
+    fn expand(seed: &[u8; 32]) -> [u8; 64] {
+        core::sha512::sha512(seed)
+    }
+
+    /// Exactly what `search` does with a matched key.
+    fn host_pubkey(expanded: &[u8; 64]) -> [u8; 32] {
+        let esk = ed25519_dalek::hazmat::ExpandedSecretKey::from_bytes(expanded);
+        *ed25519_dalek::VerifyingKey::from(&esk).as_bytes()
+    }
+
+    #[test]
+    fn host_pubkey_matches_rfc8032() {
+        let got = host_pubkey(&expand(&SEED));
+        assert_eq!(
+            got, PUBLIC,
+            "host pubkey is not the RFC 8032 one; an expanded key is being \
+             treated as a seed (or vice versa), so every match would be \
+             discarded as a non-match at runtime"
+        );
+    }
+
+    #[test]
+    fn host_pubkey_matches_the_device_crate() {
+        // The kernel does not call dalek. It clamps and multiplies with its own
+        // field arithmetic, so agreement here is what makes the prefix check
+        // meaningful: if these two disagree, the kernel matches one address and
+        // the host prints another.
+        let expanded = expand(&SEED);
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&expanded[..32]);
+        scalar[0] &= 248;
+        scalar[31] &= 127;
+        scalar[31] |= 64;
+
+        let mut base: core::group::BaseTables = unsafe { std::mem::zeroed() };
+        core::group::build_comb_table(&mut base.comb, &mut base.eight);
+        let point = core::group::scalarmult_base_comb(&scalar, &base.comb);
+        let zi = core::field::fe_invert(&point.z);
+        let device_pubkey = core::group::ge_to_bytes_with_zi(&point, &zi);
+
+        assert_eq!(
+            host_pubkey(&expanded),
+            device_pubkey,
+            "host and device derive different public keys for the same expanded \
+             key, so the host would reject every match the kernel publishes"
+        );
+    }
+
+    #[test]
+    fn onion_address_is_lowercase_base32() {
+        // base32 0.5 made the alphabets case-specific. `Rfc4648` now emits
+        // uppercase, and a Tor address that comes out uppercase is not
+        // recognised as one, so this pins the lowercase alphabet.
+        let onion = pubkey_to_onion(&PUBLIC);
+        assert_eq!(onion.len(), 56 + ".onion".len());
+        assert!(onion.ends_with(".onion"));
+        assert!(
+            onion[..56].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "onion body must be lowercase base32, got {:?}",
+            onion
+        );
+        // And it must round-trip: decoding the body must give the pubkey back.
+        let body = &onion[..56];
+        let decoded = base32::decode(base32::Alphabet::Rfc4648Lower { padding: false }, body)
+            .expect("onion body must be decodable");
+        assert_eq!(&decoded[..32], &PUBLIC[..], "onion must encode the pubkey");
+        assert_eq!(decoded[32..34].len(), 2);
+        assert_eq!(decoded[34], 3, "version byte must be 3");
+    }
+
+    #[test]
+    fn every_seed_agrees_between_host_and_device() {
+        // One vector could be coincidence. Sweep deterministically so a
+        // systematic disagreement -- an off-by-one in the clamp, a wrong half
+        // taken of the digest -- shows up.
+        let mut base: core::group::BaseTables = unsafe { std::mem::zeroed() };
+        core::group::build_comb_table(&mut base.comb, &mut base.eight);
+        for i in 0..64u8 {
+            let mut seed = [0u8; 32];
+            for (k, b) in seed.iter_mut().enumerate() {
+                *b = i.wrapping_mul(31).wrapping_add(k as u8 * 7);
+            }
+            let expanded = expand(&seed);
+            let mut scalar = [0u8; 32];
+            scalar.copy_from_slice(&expanded[..32]);
+            scalar[0] &= 248;
+            scalar[31] &= 127;
+            scalar[31] |= 64;
+            let point = core::group::scalarmult_base_comb(&scalar, &base.comb);
+            let zi = core::field::fe_invert(&point.z);
+            assert_eq!(
+                host_pubkey(&expanded),
+                core::group::ge_to_bytes_with_zi(&point, &zi),
+                "seed {} disagrees between host and device",
+                i
+            );
+        }
     }
 }

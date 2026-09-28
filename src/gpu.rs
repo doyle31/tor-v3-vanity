@@ -14,6 +14,35 @@ use std::sync::Arc;
 use failure::Error;
 use tor_v3_vanity_core as core;
 
+/// Default threads per block, from `kernel.conf` via `build.rs`.
+///
+/// Deliberately *not* `core::BLOCK`. The device crate is a separate
+/// compilation, and `option_env!` inside it resolves when that crate is
+/// compiled -- `cargo:rustc-env` from this crate's build script does not reach
+/// a dependency's compilation. So the host read the dependency's default of 256
+/// while the kernel was built with the file's 128, and the setting silently
+/// did nothing. This constant is set for the host's own compilation, and both
+/// values come from the same file.
+pub const DEFAULT_BLOCK: usize = match option_env!("T3V_BLOCK") {
+    Some(s) => parse_usize(s.as_bytes()),
+    None => 256,
+};
+
+/// Compile-time decimal parse, mirroring the device crate's own.
+const fn parse_usize(bytes: &[u8]) -> usize {
+    let mut out: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < b'0' || c > b'9' {
+            break;
+        }
+        out = out * 10 + (c - b'0') as usize;
+        i += 1;
+    }
+    out
+}
+
 /// Count of keys that matched but could not be captured, shared with the
 /// caller so a saturated ring is reported rather than silently losing keys.
 pub type Dropped = Arc<AtomicU64>;
@@ -325,7 +354,7 @@ fn geometry(
         Some(t) => t.min(fn_max_threads).min(gpu_max_threads),
         None => *[
             fn_max_threads,
-            gpu_max_threads.min(core::BLOCK as u32),
+            gpu_max_threads.min(DEFAULT_BLOCK as u32),
             by_occupancy,
         ]
         .iter()

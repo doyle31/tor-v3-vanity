@@ -246,11 +246,18 @@ fn build_kernel(tunables: &Tunables) -> Result<PathBuf> {
         cmd.env("RUSTFLAGS", flags);
     }
 
-    // The tunables have to be set on the nested command: they are compile-time
-    // constants of the device crate, read there with `option_env!`. Setting
-    // `cargo:rustc-env` here would only reach the host crate.
+    // The tunables have to reach *both* compilations, from the same source.
+    //
+    // The device crate is compiled by the nested command below, and reads them
+    // with `option_env!`; that needs them in the nested process's environment.
+    // The host crate is a separate compilation that also reads the same
+    // constants -- `core::BLOCK` picks the launch geometry -- and gets them
+    // from `cargo:rustc-env`. Setting only one of the two leaves the two
+    // compilations disagreeing, which is exactly how a value in kernel.conf
+    // ends up in the kernel but not in the host that launches it.
     for (var, value) in tunables {
         cmd.env(var, value.to_string());
+        println!("cargo:rustc-env={var}={value}");
     }
 
     let output = cmd.output()?;

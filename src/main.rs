@@ -282,3 +282,4 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
         eprintln!("error closing output: {}", e);
     }
 }
+

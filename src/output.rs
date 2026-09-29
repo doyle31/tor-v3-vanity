@@ -1377,6 +1377,57 @@ mod append_tests {
     }
 
     #[test]
+    fn the_refusal_only_protects_regular_files() {
+        // The one real semantic conflict between the overwrite protection and
+        // the stdout fix: `--out /dev/stdout` is a character device that always
+        // "exists", so a naive existence check refuses it and breaks piping.
+        //
+        // The guard is therefore on `is_regular_file`, not on existence. A
+        // character device has nothing to lose by being opened again, so the
+        // sink proceeds without a flag.
+        assert!(
+            !Sink::is_regular_file(Path::new("/dev/null")),
+            "/dev/null is a character device, not a regular file"
+        );
+        assert!(
+            !Sink::is_regular_file(Path::new("/dev/zero")),
+            "/dev/zero likewise"
+        );
+        // A path that does not exist yet will be created as a regular file, so
+        // it counts as one -- which is why a fresh --out is never refused.
+        let p = tmp("refuse-fresh");
+        assert!(!p.exists());
+        assert!(Sink::is_regular_file(&p), "a new path becomes a regular file");
+        // And opening a device must not be refused.
+        let r = Sink::open_format(
+            Path::new("/dev/null"),
+            Format::Csv,
+            Durability::Buffered,
+            Existing::Refuse,
+        );
+        assert!(
+            r.is_ok(),
+            "a character device must not trip the refusal: {:?}",
+            r.err()
+        );
+        // A regular file, by contrast, still is protected -- covered by
+        // `an_existing_file_is_refused_by_default`, and the distinction is what
+        // this test is for.
+        let q = tmp("refuse-regular");
+        first_run(&q, Format::Csv, 1);
+        assert!(Sink::is_regular_file(&q), "the temp file is a regular file");
+        assert!(Sink::open_format(
+            &q,
+            Format::Csv,
+            Durability::Buffered,
+            Existing::Refuse
+        )
+        .is_err());
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+    }
+
+    #[test]
     fn append_to_a_nonexistent_file_just_creates_it() {
         let p = tmp("append-new");
         assert!(!p.exists());

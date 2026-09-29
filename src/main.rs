@@ -268,7 +268,11 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             // destructive. With neither flag the sink refuses outright, and this
             // line is what tells the user why before they get the error.
             let exists = path.exists();
-            let disposition = match (existing, exists) {
+            // `Refuse` only *refuses* when there is a regular file to protect;
+            // for a character device or FIFO there is nothing to lose, so the
+            // run proceeds and the line should not claim otherwise.
+            let protecting = exists && output::Sink::is_regular_file(path);
+            let disposition = match (existing, protecting) {
                 (output::Existing::Append, true) => "appending to",
                 (output::Existing::Append, false) => "appending to (new)",
                 (output::Existing::Overwrite, true) => "OVERWRITING",

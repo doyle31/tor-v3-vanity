@@ -880,7 +880,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn keys_reach_the_file_without_an_explicit_flush() {
         // Regression: a plain BufWriter only flushes when full, so a short run
         // wrote a zero-byte file and every key it found was lost. The time-based

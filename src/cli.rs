@@ -136,7 +136,7 @@ pub fn parse() -> Options {
     // resolution, and every downstream value is lowercase by construction.
     let prefixes: Vec<String> = m
         .get_many::<String>("PREFIX")
-        .map(|v| v.map(|s| s.to_ascii_lowercase()).collect())
+        .map(|v| normalise_prefixes(v.cloned().collect()))
         .unwrap_or_default();
     // `longest` is measured after normalisation, so it is a character count of
     // what will actually be searched rather than of what was typed.
@@ -303,4 +303,73 @@ fn app() -> Command {
                 .help("Buffer output even for long prefixes, trading durability \
                        for throughput"),
         )
+}
+
+/// Normalise the prefixes the way `parse` does, as a pure function.
+///
+/// Extracted so the rule can be tested without constructing a command line.
+/// The property that matters is not "lowercases" but the combination that
+/// `gpu::prefix_spec` depends on: every prefix reaching it is lowercase, which is
+/// what makes `Rfc4648Lower` the correct alphabet. Get this wrong and base32
+/// returns `None`, the search runs, and it reports nothing -- the worst failure
+/// mode in the program, since a user waiting on a 2^40 search has no way to tell
+/// "no match yet" from "broken".
+fn normalise_prefixes(raw: Vec<String>) -> Vec<String> {
+    raw.into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::normalise_prefixes;
+
+    #[test]
+    fn uppercase_prefixes_are_lowercased() {
+        assert_eq!(normalise_prefixes(vec!["AB".into()]), vec!["ab".to_string()]);
+        assert_eq!(
+            normalise_prefixes(vec!["TorProject".into()]),
+            vec!["torproject".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_normalised_prefix_decodes_with_the_lowercase_alphabet() {
+        // The load-bearing property. `gpu::prefix_spec` decodes with
+        // `Rfc4648Lower`, which returns `None` for uppercase input. So a prefix
+        // that is still uppercase when it arrives there yields no bytes, the
+        // search finds nothing, and nothing reports why.
+        //
+        // Checked by decoding, not by string comparison: the failure is not
+        // visible in the string, only in what the decoder does with it.
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        for &c in ALPHABET {
+            for typed in [c, c.to_ascii_uppercase()] {
+                let got = normalise_prefixes(vec![String::from(typed as char)]);
+                assert!(base32::decode(
+                    base32::Alphabet::Rfc4648Lower { padding: false },
+                    &format!("{}aa", got[0])
+                )
+                .is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn normalisation_is_idempotent() {
+        let once = normalise_prefixes(vec!["MIXEDcase7".into()]);
+        let twice = normalise_prefixes(once.clone());
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn several_prefixes_are_all_normalised() {
+        // Multiple prefixes are a documented feature, and the per-key-file
+        // output names each one, so a missed normalisation would also produce
+        // wrongly-cased filenames.
+        assert_eq!(
+            normalise_prefixes(vec!["AB".into(), "cd".into(), "EF".into()]),
+            vec!["ab".to_string(), "cd".to_string(), "ef".to_string()]
+        );
+    }
 }

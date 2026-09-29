@@ -236,26 +236,181 @@ fn emit(w: &mut BufWriter<File>, g: &mut Flusher) -> io::Result<()> {
     Ok(())
 }
 
+/// What to do about an `--out` file that already exists.
+///
+/// # Why the default refuses rather than truncating
+///
+/// A search can run for hours and produce keys that are expensive to reproduce,
+/// and `--out keys.csv` is a short, natural thing to type. When the default was
+/// to truncate, re-running that command silently destroyed the previous run's
+/// work -- the worst possible outcome, because nothing errors, nothing is
+/// reported, and the loss is discovered later when the file is found short.
+///
+/// So the default is [`Existing::Refuse`]: an existing file is an error, and the
+/// message names both ways forward. Overwriting is then something a user asks
+/// for by name, which it should be.
+///
+/// [`Existing::Append`] is the mode that makes a long search resumable, since
+/// re-running it with the same `--out` adds to what is already there.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Existing {
+    /// Refuse to touch a file that is already there.
+    Refuse,
+    /// Add to what is already there.
+    Append,
+    /// Truncate it and start over.
+    Overwrite,
+}
+
+impl Existing {
+    /// The policy the flags select. Without `--append` or `--overwrite` the
+    /// answer is [`Existing::Refuse`], not a silent overwrite.
+    pub fn from_flags(append: bool, overwrite: bool) -> Self {
+        match (append, overwrite) {
+            (true, true) => Existing::Overwrite,
+            (true, false) => Existing::Append,
+            (false, true) => Existing::Overwrite,
+            (false, false) => Existing::Refuse,
+        }
+    }
+}
+
+/// Prepare an existing JSON array file for appending, in place.
+///
+/// Returns how many records it already holds.
+///
+/// A JSON array is one document, so appending to it means undoing the closing
+/// bracket `finish` wrote: the new records have to go back *inside* the array or
+/// the file stops being valid JSON. That is why this rewrites the tail rather
+/// than simply seeking to the end.
+///
+/// The file is only ever truncated, never extended, and the bytes removed are
+/// exactly the trailing whitespace and the `]`. A file that is not an array at
+/// all therefore loses its last character, which is the one destructive case --
+/// it is why this is only reached for `Append` on a `.json` sink, and the tests
+/// cover the ordinary resume, the empty array, and the no-bracket case.
+fn resume_json_array(path: &Path) -> io::Result<u64> {
+    use std::io::{Read, Seek, Write};
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let mut all = Vec::new();
+    f.read_to_end(&mut all)?;
+
+    // Count the records already present. Each is one `{`, and only the
+    // separator before the *next* record depends on this being non-zero.
+    let existing = all.iter().filter(|b| **b == b'{').count() as u64;
+    if existing == 0 {
+        // Genuinely empty, or an array with no records. Neither has a bracket
+        // to remove; an empty file still needs its opening bracket.
+        if all.is_empty() {
+            f.rewind()?;
+            f.write_all(b"[\n")?;
+        }
+        f.flush()?;
+        return Ok(0);
+    }
+
+    let mut cut = all.len();
+    while cut > 0 && all[cut - 1].is_ascii_whitespace() {
+        cut -= 1;
+    }
+    if cut > 0 && all[cut - 1] == b']' {
+        cut -= 1;
+    }
+    f.set_len(cut as u64)?;
+    f.flush()?;
+    Ok(existing)
+}
+
 impl Sink {
-    /// Open a sink for `path` in an explicit `format`.
+    /// Open a sink for `path` in an explicit `format`, applying `existing` to a
+    /// file that is already there.
     ///
     /// The format is a parameter rather than something derived from `path`, so
     /// any filename works with any format. See [`Sink::open`] for the
     /// extension-inferring convenience wrapper.
-    pub fn open_format(path: &Path, format: Format, durability: Durability) -> io::Result<Self> {
-        let file = File::create(path)?;
-        let w = BufWriter::with_capacity(1 << 16, file);
+    ///
+    /// # What happens to an existing file
+    ///
+    /// [`Existing::Refuse`] is the default and returns an error, because a search
+    /// can run for hours and its output is expensive to reproduce. Overwriting is
+    /// then a deliberate act rather than a side effect of retyping a command.
+    ///
+    /// Each format then needs different care to stay well-formed:
+    ///
+    /// * **CSV** and **JSON Lines** are self-delimiting, so records simply
+    ///   follow on. A CSV *header* is written only for a new file -- repeating it
+    ///   mid-file would stop the result being a valid CSV.
+    /// * **JSON array** is one document, so the closing `]` has to be removed
+    ///   before appending, or the new records land outside the array and the
+    ///   file is no longer valid JSON. See [`resume_json_array`].
+    pub fn open_format(
+        path: &Path,
+        format: Format,
+        durability: Durability,
+        existing: Existing,
+    ) -> io::Result<Self> {
+        use std::io::Write as _;
+
+        // The refusal has to happen before anything is opened for writing, and
+        // it is a distinct error rather than the `AlreadyExists` the OS would
+        // give, because the remedy is not "pick another name" -- it is
+        // `--append` or `--overwrite`.
+        if existing == Existing::Refuse && path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists; refusing to overwrite it.\n  \
+                     --append  add to it, keeping what is already there\n  \
+                     --overwrite  discard it and start over",
+                    path.display()
+                ),
+            ));
+        }
+
+        // A JSON array has to rewrite its own tail, so it cannot be opened in
+        // append mode below. Handle it first and return.
+        if existing == Existing::Append && format == Format::JsonArray && path.exists() {
+            let n = resume_json_array(path)?;
+            let f = std::fs::OpenOptions::new().append(true).open(path)?;
+            let w = BufWriter::with_capacity(1 << 16, f);
+            return Ok(Sink::JsonArray(w, n, Flusher::new(durability)));
+        }
+
+        let appending = existing == Existing::Append;
+        let resuming = appending && path.exists();
+        let file = if appending {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)?
+        } else {
+            // `create` truncates an existing file, which is what both Refuse
+            // (only reachable when the file does not exist) and Overwrite want.
+            File::create(path)?
+        };
+        let mut w = BufWriter::with_capacity(1 << 16, file);
         let g = Flusher::new(durability);
         match format {
             Format::Csv => {
-                let mut w = w;
-                w.write_all(b"onion,expanded_key,matched_prefix\n")?;
+                // A header belongs to the file, not to each run.
+                if !resuming {
+                    w.write_all(b"onion,expanded_key,matched_prefix\n")?;
+                }
                 w.flush()?;
                 Ok(Sink::Csv(w, g))
             }
-            Format::JsonLines => Ok(Sink::JsonLines(w, 0, g)),
+            Format::JsonLines => {
+                w.flush()?;
+                Ok(Sink::JsonLines(w, 0, g))
+            }
             Format::JsonArray => {
-                let mut w = w;
+                // Reached when overwriting, or appending to a path that did not
+                // exist. Either way the array opens here; an existing array was
+                // handled above.
                 w.write_all(b"[\n")?;
                 w.flush()?;
                 Ok(Sink::JsonArray(w, 0, g))
@@ -268,9 +423,14 @@ impl Sink {
     ///
     /// Prefer passing the resolved `--format` value here so that a name like
     /// `keys.dat` is not silently reinterpreted.
-    pub fn open(path: &Path, explicit: Option<Format>, durability: Durability) -> io::Result<Self> {
+    pub fn open(
+        path: &Path,
+        explicit: Option<Format>,
+        durability: Durability,
+        existing: Existing,
+    ) -> io::Result<Self> {
         let format = explicit.unwrap_or_else(|| Format::from_path(path));
-        Self::open_format(path, format, durability)
+        Self::open_format(path, format, durability, existing)
     }
 
     /// A sink that writes one file per key into `dir`.
@@ -444,7 +604,7 @@ mod tests {
         // The whole point of --format: a `.json` name holding CSV, and an
         // extensionless name holding JSON, must both do what was asked.
         let p = tmp("override-json");
-        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Buffered, Existing::Overwrite).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -452,7 +612,7 @@ mod tests {
         assert!(!body.contains('['), "must not be a JSON array");
 
         let p = tmp("override-noext");
-        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered, Existing::Overwrite).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -463,7 +623,7 @@ mod tests {
     #[test]
     fn extensionless_output_falls_back_to_csv_and_still_writes() {
         let p = tmp("noext");
-        let mut s = Sink::open(&p, None, Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, None, Durability::Buffered, Existing::Overwrite).unwrap();
         s.write(&key(0)).unwrap();
         s.finish().unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
@@ -480,7 +640,7 @@ mod tests {
         for f in formats {
             for n in names {
                 let p = tmp(&format!("matrix-{}-{}", f.name(), n.replace('.', "_")));
-                let mut s = Sink::open(&p, Some(f), Durability::Buffered).unwrap();
+                let mut s = Sink::open(&p, Some(f), Durability::Buffered, Existing::Overwrite).unwrap();
                 s.write(&key(7)).unwrap();
                 s.finish().unwrap();
                 let body = std::fs::read_to_string(&p).unwrap();
@@ -513,7 +673,7 @@ mod tests {
     #[test]
     fn csv_has_header_and_one_row_per_key() {
         let p = tmp("csv");
-        let mut s = Sink::open(&p, None, Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, None, Durability::Buffered, Existing::Overwrite).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -536,7 +696,7 @@ mod tests {
     #[test]
     fn jsonl_is_one_object_per_line() {
         let p = tmp("jsonl");
-        let mut s = Sink::open(&p, Some(Format::JsonLines), Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonLines), Durability::Buffered, Existing::Overwrite).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -556,13 +716,13 @@ mod tests {
     #[test]
     fn json_array_is_valid_when_empty_and_populated() {
         let p = tmp("json-empty");
-        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered, Existing::Overwrite).unwrap();
         s.finish().unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[\n]\n");
         std::fs::remove_file(&p).unwrap();
 
         let p = tmp("json-full");
-        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Buffered, Existing::Overwrite).unwrap();
         for i in 0..3u8 {
             s.write(&key(i as u8)).unwrap();
         }
@@ -655,7 +815,8 @@ mod tests {
 
     /// Write sample records to `path` in `format` and return the file text.
     fn render(format: Format, path: &Path, keys: &[Key]) -> String {
-        let mut s = Sink::open(path, Some(format), Durability::Buffered).unwrap();
+        let mut s =
+            Sink::open(path, Some(format), Durability::Buffered, Existing::Overwrite).unwrap();
         for k in keys {
             s.write(k).unwrap();
         }
@@ -890,7 +1051,7 @@ mod tests {
             (Format::JsonLines, "dur-jsonl"),
         ] {
             let p = tmp(name);
-            let mut s = Sink::open(&p, Some(fmt), Durability::Buffered).unwrap();
+            let mut s = Sink::open(&p, Some(fmt), Durability::Buffered, Existing::Overwrite).unwrap();
             // The CSV header is written and flushed at open, so the file is
             // non-empty from the start; JSONL starts empty. Only the *keys*
             // are what this test is about.
@@ -942,7 +1103,7 @@ mod tests {
         // one is written, so a crash cannot lose it. Check that by reading the
         // file while the sink is still open and unflushed.
         let p = tmp("durable");
-        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Durable).unwrap();
+        let mut s = Sink::open(&p, Some(Format::Csv), Durability::Durable, Existing::Overwrite).unwrap();
         s.write(&key(1)).unwrap();
         let after_first = std::fs::read_to_string(&p).unwrap();
         assert!(
@@ -963,7 +1124,7 @@ mod tests {
         // each record is on disk as it is found. This checks the records are
         // individually parseable even though the array is not closed.
         let p = tmp("durable-json");
-        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Durable).unwrap();
+        let mut s = Sink::open(&p, Some(Format::JsonArray), Durability::Durable, Existing::Overwrite).unwrap();
         s.write(&key(1)).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains("\"expanded_key\""));
@@ -986,5 +1147,293 @@ mod tests {
         assert!(Format::NAMES.contains(&"csv"));
         assert!(Format::NAMES.contains(&"jsonl"));
         assert!(Format::NAMES.contains(&"json"));
+    }
+}
+
+/// Tests for `--append`, the one part of the sink that can destroy data.
+///
+/// The other formats only ever add records at the end, but a JSON array has to
+/// have its closing `]` removed before appending or the new records land outside
+/// the document. That truncation is the risky part, so it gets its own cases.
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    fn key(i: u8) -> Key {
+        let mut e = [0u8; 64];
+        for (k, b) in e.iter_mut().enumerate() {
+            *b = i.wrapping_add(k as u8);
+        }
+        Key {
+            onion: format!("abc{:0>52}.onion", i),
+            expanded: e,
+            matched: "abc".into(),
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "t3v-append-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    /// Write `n` records through a fresh sink, as a first run would.
+    fn first_run(p: &Path, format: Format, n: u8) {
+        let mut s =
+            Sink::open_format(p, format, Durability::Buffered, Existing::Overwrite).unwrap();
+        for i in 0..n {
+            s.write(&key(i)).unwrap();
+        }
+        s.finish().unwrap();
+    }
+
+    #[test]
+    fn csv_append_keeps_one_header() {
+        let p = tmp("csv-header");
+        first_run(&p, Format::Csv, 2);
+        let mut s =
+            Sink::open_format(&p, Format::Csv, Durability::Buffered, Existing::Append).unwrap();
+        s.write(&key(9)).unwrap();
+        s.finish().unwrap();
+
+        let body = read(&p);
+        // Count by line prefix, not by substring: every data row also contains
+        // "onion," in its matched_prefix column, so `matches` would count one
+        // "header" per row.
+        let lines: Vec<&str> = body.lines().collect();
+        let headers = lines.iter().filter(|l| l.starts_with("onion,")).count();
+        assert_eq!(
+            headers, 1,
+            "a repeated header makes the file invalid CSV:\n{body}"
+        );
+        let rows = lines.iter().filter(|l| l.starts_with("abc")).count();
+        assert_eq!(rows, 3, "2 from the first run and 1 appended:\n{body}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn jsonl_append_accumulates() {
+        let p = tmp("jsonl");
+        first_run(&p, Format::JsonLines, 2);
+        let mut s = Sink::open_format(
+            &p,
+            Format::JsonLines,
+            Durability::Buffered,
+            Existing::Append,
+        )
+        .unwrap();
+        s.write(&key(9)).unwrap();
+        s.finish().unwrap();
+
+        let body = read(&p);
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "one record per line, no wrapper:\n{body}");
+        for l in &lines {
+            assert!(l.starts_with('{') && l.ends_with('}'), "not a record: {l}");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn json_array_append_stays_one_valid_document() {
+        // The case that needs real work: the file ends with `]`, which has to
+        // come back off, or the appended records land outside the array.
+        let p = tmp("json-array");
+        first_run(&p, Format::JsonArray, 2);
+        let mut s = Sink::open_format(
+            &p,
+            Format::JsonArray,
+            Durability::Buffered,
+            Existing::Append,
+        )
+        .unwrap();
+        s.write(&key(9)).unwrap();
+        s.finish().unwrap();
+
+        let body = read(&p);
+        assert_eq!(
+            body.matches('[').count(),
+            1,
+            "a second `[` would mean two documents:\n{body}"
+        );
+        assert_eq!(
+            body.matches(']').count(),
+            1,
+            "the array must be closed exactly once:\n{body}"
+        );
+        assert_eq!(body.matches('{').count(), 3, "2 + 1 records:\n{body}");
+        assert!(
+            body.trim_start().starts_with('[') && body.trim_end().ends_with(']'),
+            "must be a single bracketed document:\n{body}"
+        );
+        // A stray `],` or `,,` would mean the separator logic is wrong.
+        assert!(!body.contains("],"), "no record may follow the bracket:\n{body}");
+        assert!(!body.contains(",,"), "double comma:\n{body}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn json_array_append_is_repeatable() {
+        // Three successive runs must produce one array of six, not a growing pile
+        // of fragments.
+        let p = tmp("json-array-many");
+        for run in 0..3u8 {
+            let mut s = if run == 0 {
+                Sink::open_format(&p, Format::JsonArray, Durability::Buffered, Existing::Overwrite)
+                    .unwrap()
+            } else {
+                Sink::open_format(&p, Format::JsonArray, Durability::Buffered, Existing::Append)
+                    .unwrap()
+            };
+            s.write(&key(run * 10)).unwrap();
+            s.write(&key(run * 10 + 1)).unwrap();
+            s.finish().unwrap();
+        }
+        let body = read(&p);
+        assert_eq!(body.matches('[').count(), 1, "one document:\n{body}");
+        assert_eq!(body.matches('{').count(), 6, "3 runs x 2 records:\n{body}");
+        assert!(!body.contains("],"), "no record after the bracket:\n{body}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn json_array_append_to_empty_array_does_not_double_the_bracket() {
+        // A previous run that found nothing leaves `[\n]\n`. Appending must not
+        // write a second opening bracket.
+        let p = tmp("json-array-empty");
+        first_run(&p, Format::JsonArray, 0);
+        let mut s = Sink::open_format(
+            &p,
+            Format::JsonArray,
+            Durability::Buffered,
+            Existing::Append,
+        )
+        .unwrap();
+        s.write(&key(1)).unwrap();
+        s.finish().unwrap();
+        let body = read(&p);
+        assert_eq!(body.matches('[').count(), 1, "must not re-open:\n{body}");
+        assert_eq!(body.matches('{').count(), 1, "the appended record:\n{body}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn truncate_is_still_the_default_and_discards() {
+        // --append must be opt-in: without it a second run replaces the first.
+        let p = tmp("truncate");
+        first_run(&p, Format::Csv, 3);
+        first_run(&p, Format::Csv, 1);
+        let body = read(&p);
+        let lines: Vec<&str> = body.lines().collect();
+        // Count headers as lines, not as substrings: every data row also contains
+        // the literal "onion," inside its `matched_prefix` column, so a substring
+        // count sees one per row and reads as a repeated header when it is not.
+        let headers = lines.iter().filter(|l| l.starts_with("onion,")).count();
+        let rows = lines.iter().filter(|l| l.starts_with("abc")).count();
+        assert_eq!(rows, 1, "truncating must discard the first run:\n{body}");
+        assert_eq!(headers, 1, "one header:\n{body}");
+        assert_eq!(lines.len(), 2, "a header and one row:\n{body}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn append_to_a_nonexistent_file_just_creates_it() {
+        let p = tmp("append-new");
+        assert!(!p.exists());
+        let mut s =
+            Sink::open_format(&p, Format::Csv, Durability::Buffered, Existing::Append).unwrap();
+        s.write(&key(1)).unwrap();
+        s.finish().unwrap();
+        let body = read(&p);
+        assert!(
+            body.starts_with("onion,"),
+            "a new file still gets its header:\n{body}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn existing_policy_maps_from_the_flags() {
+        // The default is the point of the whole change: with neither flag, an
+        // existing file is refused rather than overwritten.
+        assert_eq!(Existing::from_flags(false, false), Existing::Refuse);
+        assert_eq!(Existing::from_flags(true, false), Existing::Append);
+        assert_eq!(Existing::from_flags(false, true), Existing::Overwrite);
+        // clap rejects --append with --overwrite, so this combination is
+        // unreachable from the command line; Overwrite is the safe reading.
+        assert_eq!(Existing::from_flags(true, true), Existing::Overwrite);
+    }
+
+    #[test]
+    fn an_existing_file_is_refused_by_default() {
+        // The load-bearing safety property, and the reason `--overwrite` exists.
+        // `File::create` truncates, so without an explicit check a re-run would
+        // silently destroy hours of keys.
+        let p = tmp("refuse");
+        first_run(&p, Format::Csv, 3);
+        let before = read(&p);
+        assert!(before.contains("abc"), "first run wrote something");
+
+        let err = match Sink::open_format(&p, Format::Csv, Durability::Buffered, Existing::Refuse) {
+            Err(e) => e,
+            // `Sink` has no `Debug`, so `expect_err` is not available here.
+            Ok(_) => panic!("must refuse an existing file"),
+        };
+        let msg = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(msg.contains("--append"), "the error must name the remedy: {msg}");
+        assert!(msg.contains("--overwrite"), "and the other one: {msg}");
+
+        // And the file is untouched, which is the whole point.
+        assert_eq!(read(&p), before, "a refused open must not modify the file");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn overwrite_still_replaces_when_asked() {
+        let p = tmp("overwrite");
+        first_run(&p, Format::Csv, 3);
+        let mut s =
+            Sink::open_format(&p, Format::Csv, Durability::Buffered, Existing::Overwrite).unwrap();
+        s.write(&key(7)).unwrap();
+        s.finish().unwrap();
+        let body = read(&p);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("abc")).count(),
+            1,
+            "overwrite must discard the first run:
+{body}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn refusing_leaves_a_json_array_intact() {
+        // Same guarantee for the format where a wrong open is most destructive.
+        let p = tmp("refuse-json");
+        first_run(&p, Format::JsonArray, 2);
+        let before = read(&p);
+        assert!(Sink::open_format(
+            &p,
+            Format::JsonArray,
+            Durability::Buffered,
+            Existing::Refuse
+        )
+        .is_err());
+        assert_eq!(read(&p), before, "the array must be untouched");
+        let _ = std::fs::remove_file(&p);
     }
 }

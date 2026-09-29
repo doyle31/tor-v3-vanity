@@ -51,6 +51,12 @@ pub struct Options {
     pub out: Option<PathBuf>,
     pub format: Option<output::Format>,
     pub dst: Option<PathBuf>,
+    /// Add to an existing `--out` file instead of replacing it.
+    pub append: bool,
+    /// Replace an existing `--out` file.
+    pub overwrite: bool,
+    /// Stop after this many keys, zero for no limit.
+    pub count: u64,
     /// Seconds between progress lines; zero silences them.
     pub log_interval: Duration,
     pub verbose: bool,
@@ -74,26 +80,43 @@ pub fn parse() -> Options {
         !benchmarking
     };
 
+    // Duration and repetition count, shared by both benchmark modes.
+    //
+    // `--bench N` and `--bench-prefix N` both take seconds, and `--bench-prefix`
+    // falls back to the same default. That was already true; what was *not*
+    // explicit was that `--reps` and `--quick` could silently disagree, since
+    // `--quick` was only consulted when `--reps` was absent. An explicit
+    // `--reps 5 --quick` had no defined meaning and quietly did 5 reps. Now
+    // `--quick` is exactly "one rep" and an explicit `--reps` wins, so the
+    // combination is at least deterministic.
     let secs: u64 = m
         .get_one::<String>("bench")
-        .map(|s| s.parse().expect("--bench takes a number of seconds"))
+        .or_else(|| m.get_one::<String>("bench-prefix"))
+        .map(|s| s.parse().expect("benchmark duration takes a number of seconds"))
         .unwrap_or(30);
     let reps: usize = match m.get_one::<String>("reps") {
         Some(r) => r.parse().expect("--reps takes a count"),
         None if m.get_flag("quick") => 1,
         None => 3,
     };
+    assert!(reps >= 1, "--reps must be at least 1, got {reps}");
+    assert!(secs >= 1, "benchmark duration must be at least 1 second, got {secs}");
 
     // `--bench-prefix` wins over `--bench`: it is the more specific request, and
     // `--bench` doubles as its duration.
     let mode = match m.get_one::<String>("bench-prefix") {
         Some(len) => {
-            let len: usize = len
-                .parse()
-                .unwrap_or_else(|_| panic!("--bench-prefix takes a length, got {:?}", len));
+            let len: usize = len.parse().unwrap_or_else(|_| {
+                panic!(
+                    "--bench-prefix takes a prefix length in characters, got {:?}; \
+                     to set the duration use --bench, as in \
+                     --bench 10 --bench-prefix 4",
+                    len
+                )
+            });
             assert!(
                 (1..=12).contains(&len),
-                "--bench-prefix must be 1..=12, got {}",
+                "--bench-prefix must be 1..=12 characters, got {}",
                 len
             );
             Mode::BenchPrefix { len, secs, reps }
@@ -153,17 +176,31 @@ pub fn parse() -> Options {
         output::Durability::for_prefix_len(longest)
     };
 
+    // `--quiet` silences the progress line and the configuration summary, so a
+    // search can be piped without interleaved chatter. It is applied here rather
+    // than at each print site so there is one place that decides.
+    let quiet = m.get_flag("quiet");
+    let log_interval = match m.get_one::<String>("log-interval") {
+        Some(v) => Duration::from_secs(v.parse().expect("--log-interval takes seconds")),
+        None if quiet => Duration::from_secs(0),
+        None => Duration::from_secs(30),
+    };
+    let count: u64 = match m.get_one::<String>("count") {
+        Some(c) => c.parse().expect("--count takes a number of keys"),
+        None => 0,
+    };
+
     Options {
         mode,
         prefixes,
         out,
         format,
         dst: m.get_one::<String>("dst").map(PathBuf::from),
-        log_interval: match m.get_one::<String>("log-interval") {
-            Some(v) => Duration::from_secs(v.parse().expect("--log-interval takes seconds")),
-            None => Duration::from_secs(30),
-        },
-        verbose: m.get_flag("verbose"),
+        append: m.get_flag("append"),
+        overwrite: m.get_flag("overwrite"),
+        count,
+        log_interval,
+        verbose: m.get_flag("verbose") && !quiet,
         threads: m
             .get_one::<String>("threads")
             .map(|t| t.parse().expect("--threads takes a count")),
@@ -176,12 +213,16 @@ pub fn parse() -> Options {
 
 fn app() -> Command {
     Command::new("t3v")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Generate Tor v3 vanity .onion addresses by brute-forcing ed25519 keys on an NVIDIA GPU")
         .arg(
             Arg::new("PREFIX")
                 .required_unless_present_any(["bench", "bench-prefix"])
                 .action(ArgAction::Append)
                 .value_delimiter(',')
-                .help("Desired prefix"),
+                .value_name("PREFIX")
+                .help("Desired prefix, base32 (a-z, 2-7). Repeat or comma-separate for \
+                       several; case is ignored"),
         )
         // --- where matches go -------------------------------------------------
         .arg(
@@ -189,6 +230,7 @@ fn app() -> Command {
                 .long("dst")
                 .short('d')
                 .num_args(1)
+                .value_name("DIR")
                 .help("Destination folder for per-key files (default: cwd)"),
         )
         .arg(
@@ -196,22 +238,53 @@ fn app() -> Command {
                 .long("out")
                 .short('o')
                 .num_args(1)
+                .value_name("FILE")
                 .help("Write every match to this single file instead of many small ones"),
+        )
+        .arg(
+            Arg::new("append")
+                .long("append")
+                .short('a')
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["dst", "overwrite"])
+                .requires("out")
+                .help("Add to an existing --out file rather than replacing it, which is \
+                       what makes a long search resumable. A CSV keeps its one header, \
+                       and a .json array has its closing bracket removed so the new \
+                       records stay inside it"),
+        )
+        .arg(
+            Arg::new("overwrite")
+                .long("overwrite")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["dst", "append"])
+                .requires("out")
+                .help("Replace an existing --out file, discarding what is in it. \
+                       Without this, or --append, an existing file is an error rather \
+                       than something this tool silently deletes"),
         )
         .arg(
             Arg::new("format")
                 .long("format")
                 .short('f')
                 .num_args(1)
+                .value_name("FORMAT")
                 .value_parser(PossibleValuesParser::new(output::Format::NAMES))
                 .help("Encoding for --out. Defaults to the file extension, else csv. \
                        Setting it explicitly lets any filename hold any format"),
         )
         // --- what the kernel does ---------------------------------------------
+        //
+        // `--match` and `--no-match` are a pair and are declared as one, so clap
+        // rejects `--match --no-match` instead of letting precedence decide.
+        // Previously both could be given and the result depended on which the
+        // parser checked first -- the kind of thing that is only noticed when it
+        // produces the wrong answer.
         .arg(
             Arg::new("match")
                 .long("match")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("no-match")
                 .help("Check candidates against the prefix (default). The kernel \
                        skips compression and the batch inversion when this is off"),
         )
@@ -219,6 +292,7 @@ fn app() -> Command {
             Arg::new("no-match")
                 .long("no-match")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("match")
                 .help("Only generate keys; never test them against a prefix"),
         )
         // --- benchmarking ------------------------------------------------------
@@ -227,13 +301,17 @@ fn app() -> Command {
                 .long("bench")
                 .short('b')
                 .num_args(1)
+                .value_name("SECONDS")
                 .help("Benchmark for this many seconds, then exit (default 30). \
-                       Implies --no-match; pass --match to include matching"),
+                       Implies --no-match; pass --match to include matching. Doubles \
+                       as the duration for --bench-prefix"),
         )
         .arg(
             Arg::new("bench-prefix")
                 .long("bench-prefix")
+                .short('P')
                 .num_args(1)
+                .value_name("CHARS")
                 .help("Benchmark end-to-end for an N-character prefix: the number \
                        that actually matters, keys *found* per second"),
         )
@@ -242,6 +320,8 @@ fn app() -> Command {
                 .long("reps")
                 .short('r')
                 .num_args(1)
+                .value_name("N")
+                .requires("bench")
                 .help("Benchmark repetitions, best is reported (default 3, or 1 \
                        with --quick)"),
         )
@@ -250,7 +330,19 @@ fn app() -> Command {
                 .long("quick")
                 .short('Q')
                 .action(ArgAction::SetTrue)
+                .requires("bench")
                 .help("With a benchmark, do a single timed run"),
+        )
+        // --- how long to run ---------------------------------------------------
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .short('n')
+                .num_args(1)
+                .value_name("KEYS")
+                .help("Stop after finding this many keys, then exit cleanly. 0, the \
+                       default, means run until interrupted. Useful for collecting a \
+                       fixed number of keys without watching for them"),
         )
         // --- logging -----------------------------------------------------------
         .arg(
@@ -258,6 +350,7 @@ fn app() -> Command {
                 .long("log-interval")
                 .short('L')
                 .num_args(1)
+                .value_name("SECONDS")
                 .help("Seconds between progress lines during a search (default 30, \
                        0 to silence)"),
         )
@@ -266,30 +359,52 @@ fn app() -> Command {
                 .long("verbose")
                 .short('v')
                 .action(ArgAction::SetTrue)
+                .conflicts_with("quiet")
                 .help("Print the resolved configuration: launch geometry, register \
                        usage, matching, and output format"),
         )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .short('q')
+                .action(ArgAction::SetTrue)
+                .conflicts_with("verbose")
+                .help("Print nothing but found keys. Implies a silent progress line and \
+                       no configuration summary, so a search can be piped without \
+                       interleaved chatter"),
+        )
         // --- launch geometry ---------------------------------------------------
+        //
+        // `-p` used to be --blocks-per-sm, which read as "prefix" and collided
+        // with the positional. These are both overrides for a choice the program
+        // already makes well from the kernel's register count, so they are
+        // grouped as `overrides` and the short flags follow the noun: -t for
+        // threads, -b is taken by --bench so blocks gets -B.
         .arg(
             Arg::new("threads")
                 .long("threads")
                 .short('t')
                 .num_args(1)
+                .value_name("N")
                 .help("Threads per block. Default: derived from the kernel's register \
                        usage, which is what actually limits occupancy"),
         )
         .arg(
             Arg::new("blocks-per-sm")
                 .long("blocks-per-sm")
-                .short('p')
+                .short('B')
                 .num_args(1)
+                .value_name("N")
                 .help("Blocks per SM to launch. Default: fill the device"),
         )
         // --- durability -------------------------------------------------------
+        //
+        // A pair, like --match/--no-match, and rejected when both are given.
         .arg(
             Arg::new("fsync")
                 .long("fsync")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("no-fsync")
                 .help("fsync every key, so it survives a crash or power loss. \
                        The default already follows the prefix length: on for 5 \
                        characters and longer, where a key arrives every few \
@@ -300,6 +415,7 @@ fn app() -> Command {
             Arg::new("no-fsync")
                 .long("no-fsync")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("fsync")
                 .help("Buffer output even for long prefixes, trading durability \
                        for throughput"),
         )

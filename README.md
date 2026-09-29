@@ -41,23 +41,61 @@ t3v --dst mykeys/ myprefix
 # several prefixes at once
 t3v --dst mykeys/ foo,bar,baz
 
-# every match appended to one file
+# every match in one file, truncated on each run
 t3v -o keys.csv foo
 t3v -o keys.json --format json foo
+
+# ...or add to it across runs, so a long search can be resumed
+t3v -o keys.csv --append foo
+
+# replacing an existing file has to be asked for by name
+t3v -o keys.csv --overwrite foo
+
+# stop once you have enough, rather than watching for them
+t3v -n 10 foo
+
+# just the addresses, nothing else, for piping
+t3v --quiet foo | tee addrs.txt
 
 # a key Tor will accept as hs_ed25519_secret_key
 cat mykeys/foo*.onion > /var/lib/tor/hidden_service/hs_ed25519_secret_key
 ```
 
-Prefixes are base32 (`a-z`, `2-7`), at most 12 characters. Output is one file
-per key by default; `--out` writes every match to a single file, whose encoding
-follows `--format` or, failing that, the file extension.
+Prefixes are base32 (`a-z`, `2-7`), at most 12 characters, and case is ignored.
+Output is one file per key by default; `--out` writes every match to a single
+file, whose encoding follows `--format` or, failing that, the file extension.
+
+Writing to an `--out` file that already exists is **refused**, because a search
+can run for hours and its output is expensive to reproduce. Re-running the same
+command stops with an error instead of silently discarding the previous run, and
+names both ways forward:
+
+```sh
+t3v -o keys.csv foo
+# error: keys.csv already exists; refusing to overwrite it.
+#   --append  add to it, keeping what is already there
+#   --overwrite  discard it and start over
+```
+
+`--append` adds to the file, which is what makes a long search resumable: run it
+again with the same `--out` and the keys pile up. The result stays a single
+well-formed file — a CSV keeps its one header rather than repeating it, and a
+`.json` array has its closing bracket removed so the new records stay *inside*
+the document. `--overwrite` replaces it, and only then is anything discarded.
+
+Both require `--out`; per-key `--dst` output has no equivalent problem, since
+each key is its own file and re-running simply rewrites the same ones.
 
 Keys are written as they are found, so a search can be interrupted at any point
 and everything already on disk is usable. At 5 characters and longer the tool
 `fsync`s each key by default: those searches run for hours, a key arrives every
 few seconds, and durability is free. Below 5 characters keys arrive thousands per
 second and `fsync` is not. `--fsync` and `--no-fsync` override.
+
+`--count N` stops after N keys and exits through the normal shutdown path, so the
+output file is finished properly — a `.json` array still gets its closing bracket.
+`--quiet` silences the progress line and the configuration summary, leaving only
+the addresses.
 
 ## Benchmarking
 

@@ -178,6 +178,9 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
     let max_len = prefixes
         .iter()
         .fold(0, |acc, x| std::cmp::max(acc, x.len()));
+    // `--count N` stops after N keys; 0 means run until interrupted.
+    let limit = opts.count;
+    let mut written: u64 = 0;
 
     // One of two sinks: a single consolidated file, or a directory of per-key
     // Tor key files.
@@ -186,16 +189,38 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             let chosen = opts
                 .format
                 .unwrap_or_else(|| output::Format::from_path(path));
+            let existing = output::Existing::from_flags(opts.append, opts.overwrite);
+            // Say what will happen to an existing file, because the difference is
+            // destructive. With neither flag the sink refuses outright, and this
+            // line is what tells the user why before they get the error.
+            let exists = path.exists();
+            let disposition = match (existing, exists) {
+                (output::Existing::Append, true) => "appending to",
+                (output::Existing::Append, false) => "appending to (new)",
+                (output::Existing::Overwrite, true) => "OVERWRITING",
+                (output::Existing::Overwrite, false) => "writing",
+                (output::Existing::Refuse, true) => "refusing to overwrite",
+                (output::Existing::Refuse, false) => "writing",
+            };
             eprintln!(
-                "Writing matches to {} ({}, {})",
+                "Writing matches to {} ({}, {}, {})",
                 path.display(),
                 chosen.name(),
+                disposition,
                 match opts.durability {
                     output::Durability::Durable => "fsync per key",
                     output::Durability::Buffered => "buffered",
                 }
             );
-            output::Sink::open_format(path, chosen, opts.durability).unwrap()
+            // A refusal is a user error, not a crash: report it and exit non-zero
+            // with the remedy, rather than unwrapping into a panic.
+            match output::Sink::open_format(path, chosen, opts.durability, existing) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         None => {
             let dst = opts
@@ -303,6 +328,20 @@ fn search(opts: &cli::Options, launch: gpu::Launch) {
             matched,
         })
         .unwrap();
+        written += 1;
+
+        // `--count` stops the search once enough keys are on disk. The exit is
+        // through `break` rather than a flag so the normal shutdown path below
+        // still runs: the sink is finished, so a `.json` array gets its closing
+        // bracket, and the GPU threads are joined before CUDA is torn down.
+        //
+        // A key that arrived in the same batch as the one that hit the limit is
+        // not written, so the count is an exact "at least" bound rather than an
+        // overshoot -- the batch is drained from the channel in order and the
+        // loop breaks the moment the target is reached.
+        if limit != 0 && written >= limit {
+            break;
+        }
     }
 
     // Shut down cleanly. Ask the GPU threads to stop, then *wait* for them

@@ -29,12 +29,64 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Set by the signal handler, polled by the main loop.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 pub fn requested() -> &'static AtomicBool {
     &SIGNALLED
+}
+
+/// How often [`sleep_unless_signalled`] wakes up to check the flag.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Sleep for up to `total`, returning early if a shutdown signal arrives.
+///
+/// Returns `true` if the full duration elapsed, `false` if it was cut short.
+///
+/// # Why this exists rather than a plain `thread::sleep`
+///
+/// `thread::sleep` cannot be interrupted by a signal handler, so a benchmark
+/// that slept for its full duration ignored Ctrl-C until the timer expired.
+/// The handler ran, the flag was set, and nothing was looking at it, and the
+/// sleep carried on regardless: the child process had already received the same
+/// SIGINT and exited, so it sat as an unreaped **zombie** for the rest of the
+/// run, and the parent lingered until the timer was up.
+///
+/// Two things had to be wrong for that, and both are easy to reintroduce:
+///
+/// * the caller must not check the flag only *after* an uninterruptible sleep,
+///   because the sleep has by then already run to completion; and
+/// * a check on the sleep's return path alone is not enough either, because the
+///   sleep is what has to be broken up.
+///
+/// `SA_RESTART` is deliberately not relied upon here. Per `signal(7)` it leaves
+/// `nanosleep` returning `EINTR`, but Rust's `thread::sleep` is a condition
+/// variable wait rather than a raw `nanosleep`, so it resumes after the handler
+/// returns regardless of the flag. Slicing the wait is what actually makes the
+/// signal observable.
+///
+/// The caller's own `Instant`-based elapsed measurement is unaffected: this only
+/// bounds how long we wait to *notice*, not how accurately time is recorded.
+pub fn sleep_unless_signalled(total: Duration) -> bool {
+    // Check before sleeping, so a signal that arrived before the call is not
+    // made to wait out one slice.
+    if requested().load(Ordering::SeqCst) {
+        return false;
+    }
+    let deadline = Instant::now() + total;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let left = deadline - now;
+        std::thread::sleep(if left < POLL { left } else { POLL });
+        if requested().load(Ordering::SeqCst) {
+            return false;
+        }
+    }
 }
 
 /// Install handlers for SIGTERM and SIGINT.
@@ -147,5 +199,38 @@ mod tests {
         // Installing twice must not error, and the flag must survive it.
         install().expect("install");
         install().expect("second install");
+    }
+
+    #[test]
+    fn sleep_unless_signalled_runs_the_full_duration_when_unsignalled() {
+        // The normal path: nothing has signalled, so it must actually wait, and
+        // it must not return early. If this regressed to a no-op, every
+        // benchmark would measure a fraction of a second and the bug would look
+        // like a throughput problem rather than a timing one.
+        SIGNALLED.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        assert!(sleep_unless_signalled(Duration::from_millis(200)));
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(180),
+            "returned after {took:?}, before the 200ms it was asked for"
+        );
+    }
+
+    #[test]
+    fn sleep_unless_signalled_returns_early_once_signalled() {
+        // The property that fixes the hang. Set the flag before the call, as a
+        // handler would, and a 30-second wait must come back essentially at
+        // once. A plain `thread::sleep` here would take the full 30 s.
+        SIGNALLED.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let completed = sleep_unless_signalled(Duration::from_secs(30));
+        let took = start.elapsed();
+        SIGNALLED.store(false, Ordering::SeqCst);
+        assert!(!completed, "must report that it did not run the full duration");
+        assert!(
+            took < Duration::from_secs(1),
+            "took {took:?} to notice a signal that was already set"
+        );
     }
 }

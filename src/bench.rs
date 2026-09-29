@@ -31,7 +31,7 @@ pub fn once(
     prefixes: &[String],
     secs: u64,
     launch: Launch,
-) -> (u64, f64) {
+) -> Option<(u64, f64)> {
     use crossbeam_channel::bounded;
 
     // The counter channel is bounded(1), so it must be drained continuously or
@@ -57,7 +57,10 @@ pub fn once(
         gpu::start(prefixes, send, send_tries, Some(stop.clone()), launch).unwrap();
 
     let start = Instant::now();
-    std::thread::sleep(Duration::from_secs(secs));
+    // Interruptible, so Ctrl-C does not park the process here for the full
+    // duration; see `signal::sleep_unless_signalled`. Elapsed time is still
+    // measured with `Instant`, so slicing the wait costs no accuracy.
+    let completed = crate::signal::sleep_unless_signalled(Duration::from_secs(secs));
     let elapsed = start.elapsed().as_secs_f64();
     let keys = total.load(Ordering::Relaxed);
 
@@ -69,14 +72,23 @@ pub fn once(
     for worker in workers {
         let _ = worker.join();
     }
-    (keys, elapsed)
+    if completed {
+        Some((keys, elapsed))
+    } else {
+        None
+    }
 }
 
 /// Run `reps` timed runs and return the best keys/s, in millions.
-pub fn kernel(prefixes: &[String], secs: u64, reps: usize, launch: Launch) -> f64 {
+///
+/// `None` means a run was interrupted, so there is no valid rate to report.
+pub fn kernel(prefixes: &[String], secs: u64, reps: usize, launch: Launch) -> Option<f64> {
     let mut best = 0f64;
     for rep in 1..=reps {
-        let (keys, elapsed) = once(prefixes, secs, launch);
+        let Some((keys, elapsed)) = once(prefixes, secs, launch) else {
+            eprintln!("interrupted: no benchmark result");
+            return None;
+        };
         let rate = keys as f64 / elapsed;
         best = best.max(rate);
         if reps > 1 {
@@ -90,7 +102,7 @@ pub fn kernel(prefixes: &[String], secs: u64, reps: usize, launch: Launch) -> f6
             );
         }
     }
-    best / 1e6
+    Some(best / 1e6)
 }
 
 /// Benchmark end-to-end for a prefix of length `len`, reporting keys *found*
@@ -100,7 +112,7 @@ pub fn kernel(prefixes: &[String], secs: u64, reps: usize, launch: Launch) -> f6
 /// prefix verification and the output sink. A random prefix is used each rep so
 /// one unlucky prefix cannot flatter or spoil the result; the expected yield is
 /// one key per `2^(5*len)`.
-pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> f64 {
+pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> Option<f64> {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut best = 0f64;
 
@@ -140,10 +152,27 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> f64 {
         // the harness. Nothing needs the intermediate samples -- the child is
         // killed at the end and the file on disk is the whole result -- so
         // sample once, after the kill.
-        std::thread::sleep(Duration::from_secs(secs));
+        // Interruptible, so Ctrl-C does not park the process here for the full
+        // duration; see `signal::sleep_unless_signalled`. Elapsed time is still
+        // measured with `Instant`, so slicing the wait costs no accuracy.
+        let completed = crate::signal::sleep_unless_signalled(Duration::from_secs(secs));
         let elapsed = start.elapsed().as_secs_f64();
+        // `kill` is a no-op on an already-exited child and `wait` reaps it, so
+        // this is correct on both paths. It is also the *only* thing that reaps
+        // it: the child gets the same SIGINT the parent does, so on Ctrl-C it
+        // exits first and would otherwise sit as an unreaped zombie for the
+        // rest of the run.
         let _ = child.kill();
         let _ = child.wait();
+
+        if !completed {
+            // The child was stopped by the signal part-way through, so counting
+            // its file over a window it did not run for would report a rate far
+            // below the real one. Say nothing rather than say something false.
+            eprintln!("interrupted: discarding partial benchmark");
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
 
         // Counting the file is the ground truth: it is what a real search
         // produced, including anything the host had to verify and discard.
@@ -165,5 +194,5 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> f64 {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-    best
+    Some(best)
 }

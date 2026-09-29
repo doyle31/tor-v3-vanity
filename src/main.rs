@@ -154,13 +154,18 @@ fn main() {
             reps,
             prefixes,
         } => {
-            let m = bench::kernel(&prefixes, secs, reps, launch);
-            println!("{:.3}", m);
+            // `None` means the run was interrupted, and an interrupted
+            // benchmark has no valid rate: print nothing rather than print a
+            // number measured over a window that was cut short.
+            if let Some(m) = bench::kernel(&prefixes, secs, reps, launch) {
+                println!("{:.3}", m);
+            }
         }
         Mode::BenchPrefix { len, secs, reps } => {
-            let rate = bench::prefix_len(len, secs, reps, opts.verbose);
-            println!("{:.3}", rate);
-            eprintln!("prefix length {}: {:.3} keys found/s", len, rate);
+            if let Some(rate) = bench::prefix_len(len, secs, reps, opts.verbose) {
+                println!("{:.3}", rate);
+                eprintln!("prefix length {}: {:.3} keys found/s", len, rate);
+            }
         }
         Mode::Search => {
             search(&opts, launch);

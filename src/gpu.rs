@@ -212,9 +212,32 @@ pub fn start(
         workers.push(std::thread::spawn(move || {
             use rand::RngCore;
             let mut csprng = assert_crypto_rng(rand::rng());
-            let _context =
-                Context::create_and_push(ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)
-                    .unwrap();
+            // SCHED_BLOCKING_SYNC, not SCHED_AUTO. This is the flag that decides
+            // whether `stream.synchronize` spins or blocks, and with SCHED_AUTO
+            // the driver picks spin ("auto" resolves to spin when there are
+            // enough cores), so the launch worker sat at 99.5% of a core for the
+            // whole run. `perf record -F 999 -g` put 97.6% of all samples in the
+            // `Stream::synchronize` call chain at the bottom of this loop, 13.9%
+            // of them in `__vdso_clock_gettime` itself, and per-thread /proc
+            // accounting showed that one thread burning a core whether the run
+            // produced 9,062 keys or 8 -- so it was spinning on the GPU, not
+            // doing host work.
+            //
+            // `cudaDeviceScheduleAuto` is documented as: "if the number of active
+            // CUDA contexts is greater than the number of logical processors,
+            // use yield; otherwise spin." This is a 12-thread laptop with one
+            // context, so it takes the spin branch every time.
+            //
+            // The cost of blocking is wake-up latency per synchronise, which
+            // matters only when synchronise is hot. Here each launch runs ~45 ms
+            // of kernel and the loop is serialised on it -- the next launch
+            // cannot be issued until the previous retires -- so a microsecond
+            // wake-up is noise and the core is better spent elsewhere.
+            let _context = Context::create_and_push(
+                ContextFlags::MAP_HOST | ContextFlags::SCHED_BLOCKING_SYNC,
+                device,
+            )
+            .unwrap();
 
             // Re-install the signal handlers *here*, after the CUDA context
             // exists, and re-assert them on every launch below.
@@ -252,7 +275,28 @@ pub fn start(
                 .unwrap();
 
             let mut table = upload_base_tables().unwrap();
-            let stream = Stream::new(StreamFlags::NON_BLOCKING, None).unwrap();
+            // `StreamFlags::DEFAULT`, not `StreamFlags::NON_BLOCKING`.
+            //
+            // `NON_BLOCKING` is `cuStreamNonBlocking`, a *concurrency* flag, and
+            // rustacuda's own doc comment says it is "misleading" and "has no
+            // effect in most circumstances" because it does not expose the NULL
+            // stream. It says nothing about spin-vs-block, which is what
+            // `Stream::synchronize` actually chooses.
+            //
+            // The spin is real and is worth avoiding: `perf record -F 999 -g`
+            // put 97.6% of samples in the `Stream::synchronize` call chain here,
+            // 13.9% in `__vdso_clock_gettime` itself, and per-thread /proc
+            // accounting showed one thread at 99.5% of a core for the whole run
+            // whether it produced 9,062 keys or 8. So this thread spends its
+            // life spinning on the GPU rather than doing host work.
+            //
+            // The flag that actually controls it is `cudaDeviceScheduleBlockingSync`
+            // (0x04), which is a device/primary-context attribute set through
+            // `cudaSetDeviceFlags` or the context-creation flags. rustacuda 0.1
+            // exposes neither -- `StreamFlags` has exactly two values -- so
+            // switching to `DEFAULT` here is a correctness tidy-up, NOT the fix.
+            // See the note on `spin_sync` below for what is and is not achieved.
+            let stream = Stream::new(StreamFlags::DEFAULT, None).unwrap();
 
             let mut seed = [0u8; 32];
             let mut gpu_seed = DeviceBuffer::from_slice(&seed).unwrap();

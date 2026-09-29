@@ -105,53 +105,118 @@ pub fn kernel(prefixes: &[String], secs: u64, reps: usize, launch: Launch) -> Op
     Some(best / 1e6)
 }
 
-/// Benchmark end-to-end for a prefix of length `len`, reporting keys *found*
-/// per second.
+/// A random base32 prefix of `len` characters.
+///
+/// Used when `--bench` is given no prefix, so each repetition measures a
+/// different one. That is deliberate: a single fixed prefix can be unlucky, and
+/// a benchmark that reports the best of three identical runs is not measuring the
+/// thing the tool does.
+pub fn random_prefix(len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut seed = [0u8; 4];
+    rand::rng().fill_bytes(&mut seed);
+    let mut x = u32::from_le_bytes(seed);
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            ALPHABET[(x >> 16) as usize % ALPHABET.len()] as char
+        })
+        .collect()
+}
+
+/// Run whichever benchmark `matching` selects.
+///
+/// The two numbers bracket the truth and mean different things, so they are
+/// labelled rather than conflated:
+///
+/// * **matching on** runs a real search in a child process and counts the keys it
+///   writes, so the rate is *found* per second -- the number that predicts how
+///   long a search takes. The examined rate is then *derived* by multiplying by
+///   `2^(5*len)`, which is an expectation, not a measurement: a real search's
+///   yield is geometric, so a short run can land well above or below it.
+/// * **matching off** times the kernel in-process and counts launches, giving
+///   *examined* per second directly, with no matching or host work at all.
+pub fn run(
+    prefixes: &[String],
+    secs: u64,
+    reps: usize,
+    matching: bool,
+    launch: Launch,
+    verbose: bool,
+) -> Option<f64> {
+    if matching {
+        prefixes_bench(prefixes, secs, reps, launch, verbose)
+    } else {
+        kernel(&[], secs, reps, launch)
+    }
+}
+
+/// Benchmark end-to-end against `prefixes`, reporting keys *found* per second.
+///
+/// With no prefixes, a random one of `RANDOM_BENCH_PREFIX_CHARS` characters is
+/// generated per repetition.
 ///
 /// Exercises the whole path: capture ring, readback, host-side key derivation,
-/// prefix verification and the output sink. A random prefix is used each rep so
-/// one unlucky prefix cannot flatter or spoil the result; the expected yield is
-/// one key per `2^(5*len)`.
-pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> Option<f64> {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+/// prefix verification and the output sink.
+fn prefixes_bench(
+    prefixes: &[String],
+    secs: u64,
+    reps: usize,
+    launch: Launch,
+    verbose: bool,
+) -> Option<f64> {
     let mut best = 0f64;
 
     for rep in 1..=reps {
-        let mut seed = [0u8; 4];
-        rand::rng().fill_bytes(&mut seed);
-        let mut x = u32::from_le_bytes(seed);
-        let prefix: String = (0..len)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                ALPHABET[(x >> 16) as usize % ALPHABET.len()] as char
-            })
-            .collect();
+        let prefixes = if prefixes.is_empty() {
+            vec![random_prefix(crate::cli::random_bench_prefix_chars())]
+        } else {
+            prefixes.to_vec()
+        };
+        // One rate for all of them, so a multi-prefix run is compared like for
+        // like against a single-prefix one. Several prefixes of equal length each
+        // yield one key per 2^(5*len), so the combined expectation is
+        // len * prefixes.len(); the run below divides by that.
+        let longest = prefixes.iter().map(|p| p.len()).max().unwrap_or(1);
+        let uniform = prefixes.iter().all(|p| p.len() == longest);
+        assert!(
+            uniform,
+            "--bench prefixes must all be the same length, so the combined rate \
+             is meaningful; got {:?}",
+            prefixes
+        );
+        let expected = 2f64.powi(5 * longest as i32) * prefixes.len() as f64;
 
         let dir = std::env::temp_dir().join(format!("t3v-bench-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let out = dir.join("keys.csv");
         let _ = std::fs::remove_file(&out);
 
-        let expected = 2f64.powi(5 * len as i32);
         let start = Instant::now();
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.arg(&prefix).arg("-o").arg(&out).arg("--log-interval").arg("0");
+        cmd.arg("--log-interval").arg("0");
+        for p in &prefixes {
+            cmd.arg(p);
+        }
+        cmd.arg("-o").arg(&out);
         if verbose {
             cmd.arg("--verbose");
         }
+        let _ = &launch; // geometry applies to the parent; the child re-derives it
         let mut child = cmd.spawn().expect("failed to launch search");
 
         // Let the child run, then read the file exactly once.
         //
         // This used to poll: sleep 500 ms, re-read the whole output file, count
         // the lines, repeat. At a 1- or 2-character prefix that is tens of MB/s
-        // of reads *inside the measured window*, competing with the child for
+        // of reads *inside* the measured window, competing with the child for
         // page cache and CPU, so the reported rate was partly a measurement of
         // the harness. Nothing needs the intermediate samples -- the child is
         // killed at the end and the file on disk is the whole result -- so
         // sample once, after the kill.
+        //
         // Interruptible, so Ctrl-C does not park the process here for the full
         // duration; see `signal::sleep_unless_signalled`. Elapsed time is still
         // measured with `Instant`, so slicing the wait costs no accuracy.
@@ -184,10 +249,10 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> Option<f
         best = best.max(rate);
         if reps > 1 {
             println!(
-                "  run {}/{}: prefix {} -> {:.2} keys found/s (implies {:.0} keys/s examined)",
+                "  run {}/{}: {} -> {:.2} keys found/s (implies {:.0} keys/s examined)",
                 rep,
                 reps,
-                prefix,
+                prefixes.join(","),
                 rate,
                 rate * expected
             );
@@ -195,4 +260,49 @@ pub fn prefix_len(len: usize, secs: u64, reps: usize, verbose: bool) -> Option<f
         let _ = std::fs::remove_dir_all(&dir);
     }
     Some(best)
+}
+
+/// Tests for the `--bench` plumbing: the random prefix it generates, and the
+/// rules that decide which measurement runs.
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    fn a_random_prefix_is_the_requested_length_and_legal_base32() {
+        for len in 1..=12usize {
+            let p = random_prefix(len);
+            assert_eq!(p.chars().count(), len, "length for {len}");
+            assert!(
+                p.chars()
+                    .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)),
+                "{p:?} must be base32 (a-z, 2-7)"
+            );
+        }
+    }
+
+    #[test]
+    fn random_prefixes_actually_vary() {
+        // The point of generating one per repetition: a fixed prefix can be
+        // unlucky, and a benchmark reporting the best of three identical runs is
+        // not measuring what the tool does. 12 four-character prefixes colliding
+        // is about 1 in 4^12, so this cannot flake in practice.
+        let seen: std::collections::HashSet<String> = (0..12)
+            .map(|_| random_prefix(4))
+            .collect();
+        assert!(
+            seen.len() > 1,
+            "expected variety across 12 draws, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn the_default_bench_prefix_length_is_four() {
+        // Load-bearing for the reported rate, and the reason is in
+        // `cli::RANDOM_BENCH_PREFIX_CHARS`: at one character a match in 32 costs
+        // about 22% of the rate to ring publishing, so `--bench` would report a
+        // figure for a search nobody runs.
+        assert_eq!(crate::cli::random_bench_prefix_chars(), 4);
+    }
 }

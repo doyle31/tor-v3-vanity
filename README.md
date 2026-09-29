@@ -99,14 +99,31 @@ the addresses.
 
 ## Benchmarking
 
+One flag, a duration. Matching is on by default, and the two measurements
+bracket the truth:
+
 ```sh
-t3v --bench 10              # kernel only, no matching
-t3v --bench 10 --match      # kernel plus the matcher
-t3v --bench-prefix 5        # end to end: keys *found* per second
+t3v --bench 2                # random 4-character prefix, 2 seconds
+t3v --bench 5 abcd           # the prefix 'abcd', 5 seconds
+t3v --bench 5 --no-match     # kernel only, no matching
 ```
 
-`--bench-prefix` is the number that predicts how long a search takes. `--bench`
-reports keys examined per second, which is a different and much larger number.
+**With matching** (the default) a real search runs and the rate is keys
+**found** per second — the number that predicts how long a search takes. It is
+also extrapolated to keys examined by multiplying by `2^(5·len)`, which is an
+*expectation*, not a measurement: a search's yield is geometric, so a short run
+can land above or below it. Give prefixes as positional arguments; with none
+given, a random 4-character one is used per repetition, so an unlucky prefix
+cannot flatter or spoil a run. All prefixes in one run must be the same length.
+
+**With `--no-match`** the kernel is timed alone and the rate is keys
+**examined** per second: the GPU's ceiling, with no matching, no batch
+inversion and no host work. A prefix cannot be combined with it, since there is
+nothing to match against.
+
+`--bench` takes a duration and nothing else. `2` is a legal base32 prefix
+character, so a flag accepting either would make `--bench 2` ambiguous between
+"two seconds" and "the prefix 2"; prefixes are always positional instead.
 
 On an RTX 3050 6GB laptop (20 SMs, 45 W cap) the match path sustains
 **~223M keys/s**, confirmed three independent ways including a row count that

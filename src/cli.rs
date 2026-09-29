@@ -27,19 +27,53 @@ use crate::output;
 pub enum Mode {
     /// Search for the given prefixes.
     Search,
-    /// Time the kernel, optionally with matching on or off.
+    /// Time the kernel.
+    ///
+    /// Two shapes, and which one runs is decided by `matching`:
+    ///
+    /// * **matching on** (the default) runs a real search as a child process and
+    ///   counts the keys it writes, so the rate is *keys found* per second -- the
+    ///   number that predicts how long a search takes. Prefixes come from the
+    ///   positional argument, or a random four-character one per repetition.
+    /// * **matching off** (`--no-match`) times the kernel in-process and counts
+    ///   launches, so the rate is *keys examined* per second -- the GPU's ceiling,
+    ///   with no matching and no host work at all.
+    ///
+    /// Those bracket the truth: one is what the hardware can do, the other is what
+    /// a search actually achieves.
     Bench {
         secs: u64,
         reps: usize,
-        /// Prefixes to match against, empty when matching is disabled.
+        /// Prefixes to match against. Empty means `--no-match`, or a random
+        /// prefix per repetition when matching is on and none was given.
         prefixes: Vec<String>,
+        /// Whether the match path is exercised.
+        matching: bool,
     },
-    /// Time the whole pipeline for a prefix of a given length.
-    BenchPrefix {
-        len: usize,
-        secs: u64,
-        reps: usize,
-    },
+}
+
+/// Characters in the random prefix `--bench` generates when none was given.
+///
+/// Four, not one, and the choice is load-bearing for the number reported. At one
+/// character, one key in 32 matches, so every match publishes 64 bytes into the
+/// capture ring through a device-scope atomic; that costs about 22% of the rate.
+/// Measured on an RTX 3050 laptop: 1-char gave 176M keys/s and 4-char 227.5M.
+/// A one-character default would therefore report a figure for a search nobody
+/// runs.
+///
+/// Four characters is one match per 2^20 keys -- frequent enough that the matcher
+/// is genuinely exercised, rare enough that ring publishing is noise. It also
+/// makes the yield high enough that a short run measures something real: at
+/// ~227M keys/s a 4-character prefix yields ~217 keys/s, so variance over a
+/// five-second rep is a few percent.
+const RANDOM_BENCH_PREFIX_CHARS: usize = 4;
+
+/// Characters in the random prefix `--bench` generates when none was given.
+///
+/// Exposed because `bench` needs the same number when it builds one, and having
+/// it in two places would let them drift.
+pub fn random_bench_prefix_chars() -> usize {
+    RANDOM_BENCH_PREFIX_CHARS
 }
 
 /// Fully resolved options.
@@ -70,70 +104,73 @@ pub struct Options {
 pub fn parse() -> Options {
     let m = app().get_matches();
 
-    let benchmarking = m.get_one::<String>("bench").is_some()
-        || m.get_one::<String>("bench-prefix").is_some();
-    let match_enabled = if m.get_flag("no-match") {
-        false
-    } else if m.get_flag("match") {
-        true
-    } else {
-        !benchmarking
-    };
+    // Matching is ON by default everywhere, `--bench` included. Previously
+    // `--bench` implied `--no-match`, which meant the headline benchmark measured
+    // something nobody asked for: the kernel generating keys with no matcher, no
+    // inversion and no host work. `--no-match` now says that explicitly.
+    let match_enabled = !m.get_flag("no-match");
 
-    // Duration and repetition count, shared by both benchmark modes.
+    // `--bench` takes a duration and nothing else.
     //
-    // `--bench N` and `--bench-prefix N` both take seconds, and `--bench-prefix`
-    // falls back to the same default. That was already true; what was *not*
-    // explicit was that `--reps` and `--quick` could silently disagree, since
-    // `--quick` was only consulted when `--reps` was absent. An explicit
-    // `--reps 5 --quick` had no defined meaning and quietly did 5 reps. Now
-    // `--quick` is exactly "one rep" and an explicit `--reps` wins, so the
-    // combination is at least deterministic.
+    // Not a prefix as well, and that is a deliberate decision rather than a
+    // limitation. `2` is a legal base32 prefix character, so a `--bench` that
+    // accepted either would make `--bench 2` ambiguous between "two seconds" and
+    // "the prefix 2". Keeping the value numeric-only and taking prefixes from the
+    // positional removes the collision entirely: `--bench 2` is always two
+    // seconds, and a prefix is always written separately.
+    let benchmarking = m.get_one::<String>("bench").is_some();
     let secs: u64 = m
         .get_one::<String>("bench")
-        .or_else(|| m.get_one::<String>("bench-prefix"))
-        .map(|s| s.parse().expect("benchmark duration takes a number of seconds"))
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--bench takes a number of seconds, got {s:?}"))
+        })
         .unwrap_or(30);
+
+    // `--quick` is exactly one repetition; an explicit `--reps` wins, so
+    // `--reps 5 --quick` has a defined meaning rather than being decided by
+    // which the parser checked first.
     let reps: usize = match m.get_one::<String>("reps") {
         Some(r) => r.parse().expect("--reps takes a count"),
         None if m.get_flag("quick") => 1,
         None => 3,
     };
     assert!(reps >= 1, "--reps must be at least 1, got {reps}");
-    assert!(secs >= 1, "benchmark duration must be at least 1 second, got {secs}");
+    assert!(secs >= 1, "--bench must be at least 1 second, got {secs}");
 
-    // `--bench-prefix` wins over `--bench`: it is the more specific request, and
-    // `--bench` doubles as its duration.
-    let mode = match m.get_one::<String>("bench-prefix") {
-        Some(len) => {
-            let len: usize = len.parse().unwrap_or_else(|_| {
-                panic!(
-                    "--bench-prefix takes a prefix length in characters, got {:?}; \
-                     to set the duration use --bench, as in \
-                     --bench 10 --bench-prefix 4",
-                    len
-                )
-            });
-            assert!(
-                (1..=12).contains(&len),
-                "--bench-prefix must be 1..=12 characters, got {}",
-                len
-            );
-            Mode::BenchPrefix { len, secs, reps }
-        }
-        None if benchmarking => Mode::Bench {
+    let prefixes: Vec<String> = m
+        .get_many::<String>("PREFIX")
+        .map(|v| normalise_prefixes(v.cloned().collect()))
+        .unwrap_or_default();
+
+    // A prefix with matching off asks for two things at once, and the two
+    // readings disagree: a prefix only means something to match *against*, and
+    // with matching off nothing is matched. Silently ignoring the prefix would
+    // measure something other than what was asked for, so it is rejected.
+    if !match_enabled && !prefixes.is_empty() {
+        panic!(
+            "--no-match measures the kernel with nothing to match against, so a \
+             prefix makes no sense: got {prefixes:?}. Drop the prefix, or drop \
+             --no-match to measure a real search"
+        );
+    }
+
+    let mode = if benchmarking {
+        Mode::Bench {
             secs,
             reps,
-            // With matching off the kernel only generates keys. With matching
-            // on, use the prefix the caller gave, defaulting to a single
-            // character so there is something to match against.
-            prefixes: if match_enabled {
-                vec![m.get_one::<String>("PREFIX").unwrap_or(&"z".to_string()).to_string()]
-            } else {
-                vec![]
-            },
-        },
-        None => Mode::Search,
+            // Empty means "no prefix given": `bench` then generates a random one
+            // per repetition, so an unlucky prefix cannot flatter or spoil a run.
+            //
+            // Cloned because `Options.prefixes` needs it too, for the durability
+            // policy below. Under `--bench` that field is not read by the search
+            // path, but keeping one source of truth avoids a second derivation
+            // that could disagree.
+            prefixes: if match_enabled { prefixes.clone() } else { vec![] },
+            matching: match_enabled,
+        }
+    } else {
+        Mode::Search
     };
 
     let out = m.get_one::<String>("out").map(PathBuf::from);
@@ -155,12 +192,10 @@ pub fn parse() -> Options {
     // word, and `main` re-verifies a match with `onion.starts_with(prefix)`.
     // So an uppercase `AB` would decode fine but could never match the
     // lowercase address it names, and the search would run forever finding
-    // nothing. Normalise once, here, where the module's own rule puts
-    // resolution, and every downstream value is lowercase by construction.
-    let prefixes: Vec<String> = m
-        .get_many::<String>("PREFIX")
-        .map(|v| normalise_prefixes(v.cloned().collect()))
-        .unwrap_or_default();
+    // nothing. `normalise_prefixes` above does that normalisation once, here,
+    // where the module's own rule puts resolution, and every downstream value is
+    // lowercase by construction.
+    //
     // `longest` is measured after normalisation, so it is a character count of
     // what will actually be searched rather than of what was typed.
     let longest = prefixes.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -217,12 +252,14 @@ fn app() -> Command {
         .about("Generate Tor v3 vanity .onion addresses by brute-forcing ed25519 keys on an NVIDIA GPU")
         .arg(
             Arg::new("PREFIX")
-                .required_unless_present_any(["bench", "bench-prefix"])
+                .required_unless_present_any(["bench"])
                 .action(ArgAction::Append)
                 .value_delimiter(',')
                 .value_name("PREFIX")
+                .conflicts_with("no-match")
                 .help("Desired prefix, base32 (a-z, 2-7). Repeat or comma-separate for \
-                       several; case is ignored"),
+                       several; case is ignored. Under --bench, these are the prefixes \
+                       to measure; with none given, a random 4-character one is used"),
         )
         // --- where matches go -------------------------------------------------
         .arg(
@@ -285,35 +322,45 @@ fn app() -> Command {
                 .long("match")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("no-match")
-                .help("Check candidates against the prefix (default). The kernel \
-                       skips compression and the batch inversion when this is off"),
+                .help("Check candidates against the prefix (default, and the default \
+                       for --bench too)"),
         )
         .arg(
             Arg::new("no-match")
                 .long("no-match")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("match")
-                .help("Only generate keys; never test them against a prefix"),
+                .help("Only generate keys; never test them against a prefix. Under \
+                       --bench this measures the kernel alone -- keys *examined* per \
+                       second, with no matching, no batch inversion and no host work. \
+                       It is the GPU's ceiling, not what a search achieves, and it \
+                       cannot be combined with a prefix"),
         )
         // --- benchmarking ------------------------------------------------------
+        //
+        // One flag, one meaning: a duration. Prefixes come from the positional, so
+        // `--bench 2` is unambiguously two seconds rather than a coin toss between
+        // that and the prefix "2". This replaces the old `--bench-prefix`, which
+        // took a prefix *length* and could not say what prefix to use.
         .arg(
             Arg::new("bench")
                 .long("bench")
                 .short('b')
                 .num_args(1)
                 .value_name("SECONDS")
-                .help("Benchmark for this many seconds, then exit (default 30). \
-                       Implies --no-match; pass --match to include matching. Doubles \
-                       as the duration for --bench-prefix"),
-        )
-        .arg(
-            Arg::new("bench-prefix")
-                .long("bench-prefix")
-                .short('P')
-                .num_args(1)
-                .value_name("CHARS")
-                .help("Benchmark end-to-end for an N-character prefix: the number \
-                       that actually matters, keys *found* per second"),
+                .help("Benchmark for this many seconds, then exit (default 30).\n\n\
+                       With matching on (the default), a real search runs and the \
+                       rate is keys *found* per second -- the number that predicts \
+                       how long a search takes -- extrapolated to keys examined. Give \
+                       prefixes as positional arguments to match against; with none, a \
+                       random 4-character prefix is generated per repetition.\n\n\
+                       With --no-match, the kernel is timed alone and the rate is \
+                       keys *examined* per second: the GPU's ceiling, with no \
+                       matching and no host work. The two bracket the truth.\n\n\
+                       Examples:\n  \
+                         t3v --bench 2              random 4-char prefix, 2 seconds\n  \
+                         t3v --bench 5 abcd         the prefix 'abcd', 5 seconds\n  \
+                         t3v --bench 5 --no-match   kernel only, no matching"),
         )
         .arg(
             Arg::new("reps")

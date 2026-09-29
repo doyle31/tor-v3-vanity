@@ -153,18 +153,43 @@ fn main() {
             secs,
             reps,
             prefixes,
+            matching,
         } => {
-            // `None` means the run was interrupted, and an interrupted
-            // benchmark has no valid rate: print nothing rather than print a
-            // number measured over a window that was cut short.
-            if let Some(m) = bench::kernel(&prefixes, secs, reps, launch) {
-                println!("{:.3}", m);
-            }
-        }
-        Mode::BenchPrefix { len, secs, reps } => {
-            if let Some(rate) = bench::prefix_len(len, secs, reps, opts.verbose) {
-                println!("{:.3}", rate);
-                eprintln!("prefix length {}: {:.3} keys found/s", len, rate);
+            // Two numbers, and they mean different things, so each is labelled
+            // with the unit it is in rather than left for the reader to infer.
+            //
+            // `run` reports keys *found*/s when matching and keys *examined*/s
+            // when not; printing the wrong label there would make a rate look
+            // 2^20 times better or worse than it is.
+            let result = bench::run(&prefixes, secs, reps, matching, launch, opts.verbose);
+            match result {
+                // `None` means the run was interrupted, and an interrupted
+                // benchmark has no valid rate: print nothing rather than print a
+                // number measured over a window that was cut short.
+                None => {}
+                Some(found) if matching => {
+                    println!("{:.3}", found);
+                    let longest = prefixes
+                        .iter()
+                        .map(|p| p.len())
+                        .max()
+                        .unwrap_or(crate::cli::random_bench_prefix_chars());
+                    eprintln!(
+                        "{:.3} keys found/s over {}-character prefix(es); \
+                         implies {:.0} keys examined/s",
+                        found,
+                        longest,
+                        found * 2f64.powi(5 * longest as i32) * prefixes.len().max(1) as f64,
+                    );
+                }
+                Some(examined) => {
+                    println!("{:.3}", examined);
+                    eprintln!(
+                        "{:.3} keys examined/s (kernel only, no matching -- the \
+                         ceiling, not what a search achieves)",
+                        examined
+                    );
+                }
             }
         }
         Mode::Search => {
